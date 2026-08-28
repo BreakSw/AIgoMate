@@ -1,0 +1,2 @@
+"""AlgoMate agent service."""
+

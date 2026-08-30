@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ConversationMessage(BaseModel):
@@ -8,11 +8,20 @@ class ConversationMessage(BaseModel):
     content: str
 
 
+class InputOrganizationResult(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
+    organized_input: str
+    input_shape: Literal["text", "code", "mixed", "unclassified"]
+    organization_summary: str
+    organizer_model: str
+    organizer_provider: str
+
+
 class InputRewriteResult(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     input_type: Literal["text", "code", "mixed"]
     formatted_input: str
-    explicit_request: str
+    explicit_request: str | None = None
     requested_operations: list[Literal[
         "general_code_review",
         "explain_logic",
@@ -41,12 +50,14 @@ class InputRewriteResult(BaseModel):
 class AgentRequest(BaseModel):
     model_config = ConfigDict(
         alias_generator=lambda value: {
+            "user_id": "userId",
             "session_id": "sessionId",
             "previous_context_snapshot": "previousContextSnapshot",
         }.get(value, value),
         populate_by_name=True,
     )
 
+    user_id: int = 1
     session_id: int
     message: str = Field(min_length=1, max_length=12_000)
     history: list[ConversationMessage] = Field(default_factory=list)
@@ -222,13 +233,21 @@ class TurnContext(BaseModel):
     intent_provider: str
 
 
+class MemoryScope(BaseModel):
+    user_id: int
+    session_id: int
+
+
 class ContextSnapshot(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     memory: MemorySnapshot
     compressed_context: CompressedContext
     window: ContextWindowStatus
     turn_context: TurnContext | None = None
+    input_organization: InputOrganizationResult | None = None
     input_rewrite: InputRewriteResult | None = None
+    agent_execution: "AgentExecutionTrace | None" = None
+    memory_scope: MemoryScope | None = None
     # Memory frozen at the last compaction boundary. Active `memory` can keep
     # advancing every turn without changing what the checkpoint represents.
     checkpoint_memory: MemorySnapshot | None = None
@@ -254,3 +273,197 @@ class TaskSpec(BaseModel):
     confidence: float = Field(ge=0, le=1)
     clarifying_question: str | None = None
     raw_metadata: dict[str, Any] = Field(default_factory=dict, exclude=True)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def normalize_percentage_confidence(cls, value):
+        if isinstance(value, (int, float)) and 1 < value <= 100:
+            return value / 100
+        return value
+
+
+KnowledgeCollection = Literal[
+    "algorithm_concepts",
+    "problem_bank",
+    "code_cases",
+]
+
+EvidenceCollection = Literal[
+    "algorithm_concepts",
+    "problem_bank",
+    "code_cases",
+    "web_search",
+]
+
+ExecutionAgent = Literal[
+    "tutoring_agent",
+    "problem_solving_agent",
+    "code_analysis_agent",
+    "problem_structuring_agent",
+    "strategy_agent",
+    "solution_review_agent",
+    "implementation_agent",
+    "verification_agent",
+    "learning_planning_agent",
+    "conversation_agent",
+    "clarification_agent",
+]
+
+
+class RagQuery(BaseModel):
+    collection: KnowledgeCollection
+    query: str = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=1, max_length=300)
+    top_k: int = Field(default=3, ge=1, le=5)
+    required: bool = False
+
+
+class MemorySelection(BaseModel):
+    working_memory: bool = True
+    long_term_memory: bool = False
+    user_preferences: bool = False
+    pinned_constraints: bool = True
+    reason: str = Field(default="仅选择完成当前任务所需的记忆")
+
+
+MemoryKind = Literal[
+    "user_profile",
+    "preference",
+    "long_term_goal",
+    "constraint",
+    "decision",
+    "unfinished_task",
+    "learned_fact",
+]
+
+
+class MemoryUpdate(BaseModel):
+    kind: MemoryKind
+    content: str = Field(min_length=1, max_length=500)
+    importance: float = Field(default=0.7, ge=0, le=1)
+    reason: str = Field(min_length=1, max_length=300)
+
+
+class MemoryUpdateBatch(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
+    updates: list[MemoryUpdate] = Field(default_factory=list)
+    ignored_transient_details: list[str] = Field(default_factory=list)
+
+
+class DurableMemoryItem(BaseModel):
+    memory_id: str
+    kind: MemoryKind
+    content: str
+    importance: float = Field(ge=0, le=1)
+    source: Literal["memory_agent", "context_checkpoint", "user_explicit"]
+    created_at: str
+    updated_at: str
+
+
+class HeadDecision(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
+    iteration: int = Field(ge=1)
+    rationale: str = Field(min_length=1, max_length=500)
+    action: Literal[
+        "get_current_time",
+        "retrieve_rag",
+        "switch_to_native_reasoning",
+        "search_web",
+        "delegate",
+        "persist_memory",
+        "ask_clarification",
+        "finish",
+    ]
+    selected_agent: ExecutionAgent | None = None
+    task_instruction: str | None = None
+    rag_query: RagQuery | None = None
+    web_query: str | None = Field(default=None, max_length=500)
+    web_search_reason: str | None = Field(default=None, max_length=300)
+    memory_updates: list[MemoryUpdate] = Field(default_factory=list)
+    clarification_question: str | None = None
+    finish_reason: str | None = None
+
+
+class CoordinatorPlan(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
+    objective: str
+    selected_agent: ExecutionAgent
+    task_instruction: str
+    planned_steps: list[str] = Field(default_factory=list)
+    rag_queries: list[RagQuery] = Field(default_factory=list)
+    memory_selection: MemorySelection = Field(default_factory=MemorySelection)
+    execution_mode: Literal["rag_assisted", "native_reasoning"] = "native_reasoning"
+    rag_status: Literal[
+        "not_checked",
+        "candidate_found",
+        "hit",
+        "miss",
+        "insufficient",
+        "unavailable",
+        "error",
+    ] = "not_checked"
+    grounding_policy: Literal["no_rag", "prefer_rag", "require_rag"] = "no_rag"
+    requires_clarification: bool = False
+    clarification_question: str | None = None
+    known_limits: list[str] = Field(default_factory=list)
+    decision_trace: list[HeadDecision] = Field(default_factory=list)
+    web_search_queries: list[str] = Field(default_factory=list)
+
+
+class RagEvidence(BaseModel):
+    evidence_id: str
+    collection: EvidenceCollection
+    title: str
+    content: str
+    source_url: str | None = None
+    score: float = Field(ge=0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentWorkRequest(BaseModel):
+    protocol_version: Literal["1.0"] = "1.0"
+    task_spec: TaskSpec
+    coordinator_plan: CoordinatorPlan
+    conversation_context: list[ConversationMessage] = Field(default_factory=list)
+    memory: MemorySnapshot
+    durable_memory: list[DurableMemoryItem] = Field(default_factory=list)
+    dynamic_system_prompt: str = ""
+    rag_evidence: list[RagEvidence] = Field(default_factory=list)
+    prior_work_results: list["AgentWorkResult"] = Field(default_factory=list)
+
+
+class AgentWorkResult(BaseModel):
+    protocol_version: Literal["1.0"] = "1.0"
+    agent: ExecutionAgent
+    draft_answer: str
+    used_evidence_ids: list[str] = Field(default_factory=list)
+    uncertainties: list[str] = Field(default_factory=list)
+    needs_follow_up: bool = False
+
+
+class PolishResult(BaseModel):
+    protocol_version: Literal["1.0"] = "1.0"
+    final_answer: str
+    preserved_uncertainties: list[str] = Field(default_factory=list)
+    style_changes: list[str] = Field(default_factory=list)
+    added_factual_claims: bool = False
+
+
+class OutputFormatResult(BaseModel):
+    protocol_version: Literal["1.0"] = "1.0"
+    formatted_answer: str
+    formatting_changes: list[str] = Field(default_factory=list)
+    added_factual_claims: bool = False
+
+
+class AgentExecutionTrace(BaseModel):
+    protocol_version: Literal["1.0"] = "1.0"
+    task_spec: TaskSpec
+    coordinator_plan: CoordinatorPlan
+    rag_evidence: list[RagEvidence] = Field(default_factory=list)
+    work_result: AgentWorkResult
+    polish_result: PolishResult
+    format_result: OutputFormatResult | None = None
+    durable_memory: list[DurableMemoryItem] = Field(default_factory=list)
+    memory_updates: list[MemoryUpdate] = Field(default_factory=list)
+    model_call_trace: list[str] = Field(default_factory=list)

@@ -1,5 +1,6 @@
 import math
 import re
+from collections.abc import Awaitable, Callable
 
 from app.config import Settings
 from app.core.context_compressor import ContextCompressionAgent
@@ -13,6 +14,9 @@ from app.models import (
     TaskSpec,
     TurnContext,
 )
+
+
+MemoryCheckpointHook = Callable[[MemorySnapshot, str], Awaitable[None]]
 
 
 class TokenEstimator:
@@ -52,6 +56,7 @@ class ContextManager:
         history: list[ConversationMessage],
         previous_snapshot: ContextSnapshot | None = None,
         on_retry: RetryCallback | None = None,
+        checkpoint_hook: MemoryCheckpointHook | None = None,
     ) -> tuple[list[ConversationMessage], ContextSnapshot]:
         """Prepare enough context to recognize the current turn's intent."""
 
@@ -67,11 +72,15 @@ class ContextManager:
         triggered = bool(active) and candidate_input > safe_budget
 
         if triggered:
+            if checkpoint_hook is not None:
+                await checkpoint_hook(memory, "before_compression")
             checkpoint_memory, compressed = await self.compressor.compress(
                 active,
                 on_retry,
                 source_message_count=len(clean_history),
             )
+            if checkpoint_hook is not None:
+                await checkpoint_hook(checkpoint_memory, "after_compression")
             memory = checkpoint_memory
             prepared = [self.compressor.to_context_message(checkpoint_memory, compressed)]
             checkpoint_count = len(clean_history)
@@ -113,6 +122,7 @@ class ContextManager:
         task_spec: TaskSpec,
         intent_provider: str,
         on_retry: RetryCallback | None = None,
+        checkpoint_hook: MemoryCheckpointHook | None = None,
     ) -> ContextSnapshot:
         """Insert this turn's TaskSpec, then compact once only if it will not fit."""
 
@@ -150,11 +160,15 @@ class ContextManager:
         messages_before = len(candidate)
 
         if commit_compaction:
+            if checkpoint_hook is not None:
+                await checkpoint_hook(memory, "before_compression")
             checkpoint_memory, compressed = await self.compressor.compress(
                 candidate,
                 on_retry,
                 source_message_count=len(clean_history) + 2,
             )
+            if checkpoint_hook is not None:
+                await checkpoint_hook(checkpoint_memory, "after_compression")
             memory = self._merge_active_memory(checkpoint_memory, task_spec)
             final_context = [self.compressor.to_context_message(checkpoint_memory, compressed)]
             triggered = True
@@ -245,7 +259,7 @@ class ContextManager:
             user_preferences=previous.user_preferences,
             pinned_constraints=self._merge_unique(
                 previous.pinned_constraints,
-                task_spec.constraints,
+                self._durable_constraints(task_spec.constraints),
                 limit=12,
             ),
             open_questions=self._merge_unique(previous.open_questions, open_questions, limit=8),
@@ -260,6 +274,18 @@ class ContextManager:
                 if item and item not in result:
                     result.append(item)
         return result[-limit:]
+
+    @staticmethod
+    def _durable_constraints(constraints: list[str]) -> list[str]:
+        durable_markers = (
+            "以后", "始终", "一直", "默认", "每次", "都用", "记住",
+            "长期", "不要再", "从现在", "always", "never", "default",
+        )
+        return [
+            value
+            for value in constraints
+            if any(marker in value.lower() for marker in durable_markers)
+        ]
 
     def _without_audit_metadata(
         self,

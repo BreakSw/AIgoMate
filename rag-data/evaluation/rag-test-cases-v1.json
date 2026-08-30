@@ -1,0 +1,326 @@
+{
+  "schema_version": "1.0",
+  "name": "AlgoMate RAG 离线黄金测试集 v1",
+  "description": "用于检验三个 RAG 库的召回质量。测试查询不调用任何生成模型；真实向量召回测试需要预先缓存与建库模型一致的查询向量。",
+  "evaluation_defaults": {
+    "candidate_k": [1, 3, 5, 10],
+    "metrics": ["hit_at_k", "recall_at_k", "mrr_at_10"],
+    "exclude_same_document_duplicate_chunks": true
+  },
+  "cases": [
+    {
+      "id": "CONCEPT-001",
+      "collection": "algorithm_concepts",
+      "query": "动态规划到底怎么确定 dp 数组、递推公式、初始化和遍历顺序？",
+      "query_type": "semantic_concept",
+      "expected_top_k": 3,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "https://programmercarl.com/algo/dynamic-programming/dynamic-programming-basics.html",
+          "relevance_grade": 3,
+          "reason": "动态规划基础文章系统讲解 DP 五部曲。"
+        }
+      ],
+      "tags": ["动态规划", "自然语言", "方法论"]
+    },
+    {
+      "id": "CONCEPT-002",
+      "collection": "algorithm_concepts",
+      "query": "0-1 背包为什么每件物品只能选一次，二维 dp 的状态转移怎么推？",
+      "query_type": "semantic_concept",
+      "expected_top_k": 3,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "https://programmercarl.com/algo/dynamic-programming/zero-one-knapsack-basics-part-1.html",
+          "relevance_grade": 3,
+          "reason": "目标文档专门讲解二维 0-1 背包基础与状态转移。"
+        }
+      ],
+      "tags": ["动态规划", "0-1背包", "语义查询"]
+    },
+    {
+      "id": "CONCEPT-003",
+      "collection": "algorithm_concepts",
+      "query": "回溯里的递归、选择列表和撤销选择分别在做什么？",
+      "query_type": "colloquial_concept",
+      "expected_top_k": 3,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "https://programmercarl.com/algo/backtracking/backtracking-basics.html",
+          "relevance_grade": 3,
+          "reason": "回溯基础文章解释搜索树、递归和撤销选择。"
+        }
+      ],
+      "tags": ["回溯", "口语化", "递归"]
+    },
+    {
+      "id": "CONCEPT-004",
+      "collection": "algorithm_concepts",
+      "query": "数组、set 和 map 都能做哈希结构，它们在算法题里应该怎么选？",
+      "query_type": "comparative_concept",
+      "expected_top_k": 3,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "https://programmercarl.com/algo/hash-table/hash-table-basics.html",
+          "relevance_grade": 3,
+          "reason": "哈希表基础文档对常见哈希结构和使用场景进行说明。"
+        }
+      ],
+      "tags": ["哈希表", "对比", "数据结构"]
+    },
+    {
+      "id": "CONCEPT-005",
+      "collection": "algorithm_concepts",
+      "query": "请解释二叉树前序、中序、后序递归遍历的执行顺序。",
+      "query_type": "exact_concept",
+      "expected_top_k": 1,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "https://programmercarl.com/algo/binary-tree/recursive-binary-tree-traversal.html",
+          "relevance_grade": 3,
+          "reason": "目标文档直接讲解二叉树递归遍历。"
+        }
+      ],
+      "tags": ["二叉树", "递归遍历", "精确查询"]
+    },
+    {
+      "id": "CONCEPT-006",
+      "collection": "algorithm_concepts",
+      "query": "怎样用单调栈找到每个元素右边第一个比它大的值？",
+      "query_type": "semantic_concept",
+      "expected_top_k": 3,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "https://programmercarl.com/algo/monotonic-stack/0739-daily-temperatures.html",
+          "relevance_grade": 3,
+          "reason": "每日温度是寻找右侧第一个更大元素的典型单调栈案例。"
+        }
+      ],
+      "tags": ["单调栈", "右侧更大元素", "语义查询"]
+    },
+    {
+      "id": "CONCEPT-007",
+      "collection": "algorithm_concepts",
+      "query": "邻接矩阵和邻接表有什么区别，图的基本概念有哪些？",
+      "query_type": "comparative_concept",
+      "expected_top_k": 3,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "https://programmercarl.com/algo/graph/graph-theory-basics.html",
+          "relevance_grade": 3,
+          "reason": "图论基础文档涵盖图的表示与基本术语。"
+        }
+      ],
+      "tags": ["图论", "邻接表", "邻接矩阵"]
+    },
+    {
+      "id": "PROBLEM-001",
+      "collection": "problem_bank",
+      "query": "给定整数数组和 target，找出和为 target 的两个数的下标。",
+      "query_type": "problem_description",
+      "expected_top_k": 1,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "two-sum",
+          "relevance_grade": 3,
+          "reason": "描述与 LeetCode 两数之和完全对应。"
+        }
+      ],
+      "tags": ["数组", "哈希表", "题意查询"]
+    },
+    {
+      "id": "PROBLEM-002",
+      "collection": "problem_bank",
+      "query": "二维 0 和 1 网格中，上下左右相连的陆地一共有多少个独立区域？",
+      "query_type": "problem_description",
+      "expected_top_k": 1,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "number-of-islands",
+          "relevance_grade": 3,
+          "reason": "描述与岛屿数量题目完全对应。"
+        }
+      ],
+      "tags": ["图", "DFS", "BFS", "题意查询"]
+    },
+    {
+      "id": "PROBLEM-003",
+      "collection": "problem_bank",
+      "query": "每天的温度都给出来了，求还要等几天才会遇到更高温度。",
+      "query_type": "colloquial_problem",
+      "expected_top_k": 1,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "daily-temperatures",
+          "relevance_grade": 3,
+          "reason": "口语描述与每日温度题目对应。"
+        }
+      ],
+      "tags": ["单调栈", "口语化", "题意查询"]
+    },
+    {
+      "id": "PROBLEM-004",
+      "collection": "problem_bank",
+      "query": "课程之间存在先修依赖，判断能不能把所有课程都学完。",
+      "query_type": "problem_description",
+      "expected_top_k": 3,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "course-schedule",
+          "relevance_grade": 3,
+          "reason": "描述与课程表的环检测和拓扑排序场景对应。"
+        }
+      ],
+      "tags": ["图", "拓扑排序", "环检测"]
+    },
+    {
+      "id": "PROBLEM-005",
+      "collection": "problem_bank",
+      "query": "在经过旋转的升序数组里，用 O(log n) 时间查找目标值。",
+      "query_type": "constraint_problem",
+      "expected_top_k": 1,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "search-in-rotated-sorted-array",
+          "relevance_grade": 3,
+          "reason": "题意与复杂度约束共同指向搜索旋转排序数组。"
+        }
+      ],
+      "tags": ["二分查找", "复杂度约束", "旋转数组"]
+    },
+    {
+      "id": "PROBLEM-006",
+      "collection": "problem_bank",
+      "query": "找字符串 s 中包含 t 所有字符的最短连续子串。",
+      "query_type": "problem_description",
+      "expected_top_k": 1,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "minimum-window-substring",
+          "relevance_grade": 3,
+          "reason": "描述与最小覆盖子串完全对应。"
+        }
+      ],
+      "tags": ["滑动窗口", "字符串", "题意查询"]
+    },
+    {
+      "id": "CODE-001",
+      "collection": "code_cases",
+      "query": "三数之和的 Python 双指针写法，尤其是排序后如何去重。",
+      "query_type": "implementation_query",
+      "expected_top_k": 3,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "3sum",
+          "relevance_grade": 3,
+          "reason": "案例包含三数之和双指针、去重说明和 Python 代码。"
+        }
+      ],
+      "tags": ["Python", "双指针", "去重"]
+    },
+    {
+      "id": "CODE-002",
+      "collection": "code_cases",
+      "query": "接雨水怎么分别用双指针和单调栈实现？给我看代码思路。",
+      "query_type": "multi_solution_query",
+      "expected_top_k": 5,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "trapping-rain-water",
+          "relevance_grade": 3,
+          "reason": "目标案例与接雨水的实现和多解法诉求对应。"
+        }
+      ],
+      "tags": ["双指针", "单调栈", "多解法"]
+    },
+    {
+      "id": "CODE-003",
+      "collection": "code_cases",
+      "query": "用栈判断圆括号、方括号和花括号是否有效，代码怎么写？",
+      "query_type": "implementation_query",
+      "expected_top_k": 3,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "valid-parentheses",
+          "relevance_grade": 3,
+          "reason": "目标案例是有效括号的栈实现。"
+        }
+      ],
+      "tags": ["栈", "字符串", "括号匹配"]
+    },
+    {
+      "id": "CODE-004",
+      "collection": "code_cases",
+      "query": "无重复字符最长子串的滑动窗口代码，左右指针什么时候移动？",
+      "query_type": "implementation_query",
+      "expected_top_k": 3,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "longest-substring-without-repeating-characters",
+          "relevance_grade": 3,
+          "reason": "目标案例讲解滑动窗口实现和指针更新。"
+        }
+      ],
+      "tags": ["滑动窗口", "双指针", "代码查询"]
+    },
+    {
+      "id": "CODE-005",
+      "collection": "code_cases",
+      "query": "Word Break 单词拆分的动态规划实现，dp[i] 应该表示什么？",
+      "query_type": "mixed_language_query",
+      "expected_top_k": 3,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "word-break",
+          "relevance_grade": 3,
+          "reason": "中英混合查询对应单词拆分的动态规划案例。"
+        }
+      ],
+      "tags": ["动态规划", "中英混合", "代码查询"]
+    },
+    {
+      "id": "CODE-006",
+      "collection": "code_cases",
+      "query": "二叉树层序遍历如何用队列一层一层地写出来？",
+      "query_type": "colloquial_implementation",
+      "expected_top_k": 3,
+      "expected_behavior": "retrieve",
+      "relevant_documents": [
+        {
+          "document_id": "binary-tree-level-order-traversal",
+          "relevance_grade": 3,
+          "reason": "目标案例对应二叉树 BFS 层序遍历实现。"
+        }
+      ],
+      "tags": ["二叉树", "BFS", "队列"]
+    },
+    {
+      "id": "NEGATIVE-001",
+      "collection": "algorithm_concepts",
+      "query": "Spring Boot 里怎么配置 Kafka 事务消息和消费者幂等？",
+      "query_type": "out_of_domain",
+      "expected_top_k": null,
+      "expected_behavior": "no_confident_match",
+      "relevant_documents": [],
+      "tags": ["库外问题", "拒绝错误召回", "阈值测试"]
+    }
+  ]
+}

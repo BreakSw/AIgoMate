@@ -2,10 +2,11 @@ spring:
   application:
     name: algomate-backend
   datasource:
-    url: jdbc:sqlite:./data/algorithm-learning.db
+    # WAL + busy_timeout 让 SQLite 在多连接下支持并发读、写等待而不是立刻报锁错误
+    url: "jdbc:sqlite:./backend/data/algorithm-learning.db?journal_mode=WAL&busy_timeout=5000"
     driver-class-name: org.sqlite.JDBC
     hikari:
-      maximum-pool-size: 1
+      maximum-pool-size: 5
       connection-init-sql: PRAGMA foreign_keys=ON
   jpa:
     database-platform: org.hibernate.community.dialect.SQLiteDialect
@@ -19,7 +20,7 @@ spring:
     default-property-inclusion: non_null
 
 server:
-  port: 8080
+  port: 8898
 
 agent:
   service:

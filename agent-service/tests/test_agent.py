@@ -2,10 +2,79 @@ from fastapi.testclient import TestClient
 
 from app.main import app, orchestrator
 from app.core.intent_recognizer import IntentRecognizer
-from app.models import DeliverySpec, InputRewriteResult, RoutingPlan, TaskSpec
+from app.models import (
+    AgentWorkResult,
+    CoordinatorPlan,
+    DeliverySpec,
+    InputOrganizationResult,
+    InputRewriteResult,
+    MemoryUpdateBatch,
+    OutputFormatResult,
+    PolishResult,
+    RoutingPlan,
+    TaskSpec,
+)
 
 
 client = TestClient(app)
+
+
+def stub_downstream_agents(monkeypatch) -> None:
+    async def fake_organize(message, on_retry=None):
+        return InputOrganizationResult(
+            organized_input=message,
+            input_shape="text",
+            organization_summary="原样保留",
+            organizer_model="test-model",
+            organizer_provider="test-organizer",
+        )
+
+    async def fake_observe(user_message, task_spec, snapshot, existing_memory, on_retry=None):
+        return MemoryUpdateBatch(), "test-memory"
+
+    async def fake_load(user_id, session_id):
+        return []
+
+    async def fake_upsert(user_id, session_id, updates, source="memory_agent"):
+        return []
+
+    async def fake_recall(user_id, session_id, query, limit=12):
+        return []
+
+    async def fake_run(**kwargs):
+        task_spec = kwargs["task_spec"]
+        plan = CoordinatorPlan(
+            objective=task_spec.user_goal,
+            selected_agent="tutoring_agent",
+            task_instruction=task_spec.normalized_request,
+            planned_steps=["生成回答"],
+        )
+        result = AgentWorkResult(
+            agent="tutoring_agent",
+            draft_answer="这是未经润色的测试回答。",
+        )
+        return plan, [], result, [], [], ["head#1:test", "worker#2:test"]
+
+    async def fake_polish(work_result, task_spec, on_retry=None):
+        return PolishResult(
+            final_answer="这是润色后的测试回答。",
+            style_changes=["精简表达"],
+        ), "test-polish"
+
+    async def fake_format(polished, task_spec, rag_evidence, on_retry=None):
+        return OutputFormatResult(
+            formatted_answer="## 这是格式整理后的测试回答。",
+            formatting_changes=["增加标题层级"],
+        ), "test-format"
+
+    monkeypatch.setattr(orchestrator.input_organizer, "organize", fake_organize)
+    monkeypatch.setattr(orchestrator.memory_observer, "observe", fake_observe)
+    monkeypatch.setattr(orchestrator.memory_repository, "load", fake_load)
+    monkeypatch.setattr(orchestrator.memory_repository, "upsert", fake_upsert)
+    monkeypatch.setattr(orchestrator.memory_repository, "recall", fake_recall)
+    monkeypatch.setattr(orchestrator.adaptive_runtime, "run", fake_run)
+    monkeypatch.setattr(orchestrator.polish_agent, "polish", fake_polish)
+    monkeypatch.setattr(orchestrator.output_format_agent, "format", fake_format)
 
 
 def test_health() -> None:
@@ -15,6 +84,7 @@ def test_health() -> None:
 
 
 def test_agent_response(monkeypatch) -> None:
+    stub_downstream_agents(monkeypatch)
     async def fake_rewrite(message, history, on_retry=None):
         return InputRewriteResult(
             input_type="text",
@@ -49,11 +119,23 @@ def test_agent_response(monkeypatch) -> None:
     assert response.status_code == 200, response.text
     assert response.json()["intent"] == "complexity_analysis"
     assert response.json()["task_spec"]["confidence"] == 0.96
+    assert response.json()["content"] == "## 这是格式整理后的测试回答。"
+    assert response.json()["context_snapshot"]["agent_execution"]["coordinator_plan"]["selected_agent"] == "tutoring_agent"
+    assert response.json()["context_snapshot"]["agent_execution"]["model_call_trace"] == [
+        "input-organizer:test-organizer",
+        "input-rewrite:test-provider",
+        "intent:test-provider",
+        "memory:test-memory",
+        "head#1:test",
+        "worker#2:test",
+        "polish:test-polish",
+        "format:test-format",
+    ]
 
 
 def test_recognizer_builds_agent_ready_task_spec() -> None:
     class FakeModelClient:
-        async def complete_json(self, system_prompt, user_prompt, on_retry=None):
+        async def complete_json(self, system_prompt, user_prompt, on_retry=None, max_tokens=None):
             assert "不回答问题、不解题、不生成代码" in system_prompt
             assert "只给我分步提示" in user_prompt
             return """{
@@ -121,6 +203,7 @@ def test_recognizer_builds_agent_ready_task_spec() -> None:
 
 
 def test_retry_progress_is_exposed_for_sse_gateway(monkeypatch) -> None:
+    stub_downstream_agents(monkeypatch)
     async def fake_rewrite(message, history, on_retry=None):
         return InputRewriteResult(
             input_type="text",

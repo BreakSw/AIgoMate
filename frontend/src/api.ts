@@ -1,4 +1,4 @@
-import type { ChatSession, Conversation, IntentResult, StreamStatus } from './types'
+import type { ChatSession, Conversation, IntentResult, RagOverview, StreamStatus } from './types'
 
 const USER_ID = 1
 
@@ -14,6 +14,7 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 export const chatApi = {
+  getRagOverview: () => request<RagOverview>(`/api/rag/overview?userId=${USER_ID}`),
   listSessions: () => request<ChatSession[]>(`/api/sessions?userId=${USER_ID}`),
   createSession: (title?: string) =>
     request<ChatSession>('/api/sessions', {
@@ -35,6 +36,7 @@ export const chatApi = {
       onIntent: (result: IntentResult) => void
       onComplete: (conversation: Conversation) => void
     },
+    signal?: AbortSignal,
   ) => {
     const response = await fetch(`/api/sessions/${sessionId}/messages/stream`, {
       method: 'POST',
@@ -43,6 +45,7 @@ export const chatApi = {
         Accept: 'text/event-stream',
       },
       body: JSON.stringify({ userId: USER_ID, content }),
+      signal,
     })
     if (!response.ok || !response.body) {
       throw new Error(`SSE 连接失败（${response.status}）`)
@@ -78,6 +81,13 @@ export const chatApi = {
       if (done) break
     }
     if (buffer.trim()) dispatch(buffer)
+  },
+  cancelIntent: async (sessionId: number) => {
+    const response = await fetch(
+      `/api/sessions/${sessionId}/messages/stream/cancel?userId=${USER_ID}`,
+      { method: 'POST' },
+    )
+    if (!response.ok) throw new Error(`暂停失败（${response.status}）`)
   },
   deleteSession: async (sessionId: number) => {
     const response = await fetch(`/api/sessions/${sessionId}?userId=${USER_ID}`, { method: 'DELETE' })

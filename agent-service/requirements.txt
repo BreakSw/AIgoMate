@@ -4,3 +4,7 @@ pydantic-settings==2.9.1
 pydantic==2.11.4
 pytest==8.3.5
 httpx==0.28.1
+voyageai>=0.3.5,<1.0
+pymilvus>=2.6.0,<3.0
+milvus-lite>=3.2.1,<4.0
+transformers>=4.51.0,<6.0

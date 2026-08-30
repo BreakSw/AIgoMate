@@ -38,7 +38,7 @@ def extract_code_artifact(message: str) -> CodeArtifact | None:
         return CodeArtifact(code, language, instruction, not instruction)
 
     lines = message.strip().splitlines()
-    if len(lines) < 4:
+    if not lines:
         return None
 
     start_index = next((index for index, line in enumerate(lines) if CODE_START_RE.match(line)), None)

@@ -70,7 +70,7 @@ def test_plain_cpp_code_only_is_still_analyzed_by_the_model() -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        async def complete_json(self, system_prompt, user_prompt, on_retry=None):
+        async def complete_json(self, system_prompt, user_prompt, on_retry=None, max_tokens=None):
             self.calls += 1
             assert "left[target[i]" not in user_prompt
             assert "current_code_artifact" in user_prompt
@@ -89,7 +89,7 @@ def test_plain_cpp_code_only_is_still_analyzed_by_the_model() -> None:
 
 def test_code_with_instruction_is_redacted_from_prompt_and_injected_after_validation() -> None:
     class InspectingModelClient:
-        async def complete_json(self, system_prompt, user_prompt, on_retry=None):
+        async def complete_json(self, system_prompt, user_prompt, on_retry=None, max_tokens=None):
             assert "left[target[i]" not in user_prompt
             assert "current_code_artifact" in user_prompt
             assert "为什么结果不正确" in user_prompt
@@ -109,12 +109,12 @@ def test_malformed_model_json_is_regenerated_once() -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        async def complete_json(self, system_prompt, user_prompt, on_retry=None):
+        async def complete_json(self, system_prompt, user_prompt, on_retry=None, max_tokens=None):
             self.calls += 1
             if self.calls == 1:
                 return '{"primary_intent":"code_diagnosis","input_artifacts":{"code":"unterminated', "test-model"
-            assert "previous_validation_error" in user_prompt
-            assert "上一次输出未通过" in system_prompt
+            assert "validation_feedback" in user_prompt
+            assert "Reflection" in system_prompt
             return valid_code_diagnosis_json(), "test-model"
 
     model_client = RepairingModelClient()
@@ -125,7 +125,7 @@ def test_malformed_model_json_is_regenerated_once() -> None:
     ))
 
     assert model_client.calls == 2
-    assert provider == "test-model+schema-repair"
+    assert provider == "test-model+reflection:1"
     assert task_spec.primary_intent == "code_diagnosis"
     assert task_spec.input_artifacts.code == CPP_CODE
 

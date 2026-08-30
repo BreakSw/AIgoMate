@@ -1,7 +1,4 @@
-import json
 import re
-
-from pydantic import ValidationError
 
 from app.models import (
     ConversationMessage,
@@ -12,6 +9,7 @@ from app.models import (
 from app.core.code_artifact import CodeArtifact, extract_code_artifact
 from app.core.model_client import IntentModelClient
 from app.core.model_client import RetryCallback
+from app.core.reflection import complete_with_reflection
 
 
 SYSTEM_PROMPT = """你是算法学习平台的用户意图识别器。你的唯一任务是分析请求，不回答问题、不解题、不生成代码。
@@ -94,18 +92,28 @@ clarification_first 和 interactive_guidance，并追问用户希望找 Bug、�
 
 输入改写规则：请求中如果包含 input_rewrite，必须以其 formatted_input 和 requested_operations 为本轮语义入口。
 当 request_is_actionable=true 时，不得仅因为用户没有指定代码审查的细分类别而设置 clarification_first；
-general_code_review 是可直接执行的 code_diagnosis/code_review 请求，应交付代码逻辑概述和潜在问题检查。"""
+general_code_review 是可直接执行的 code_diagnosis/code_review 请求，应交付代码逻辑概述和潜在问题检查。
 
-
-REPAIR_PROMPT = SYSTEM_PROMPT + """
-
-上一次输出未通过 JSON 或 TaskSpec 校验。请根据本次输入从头生成一个新的完整 JSON 对象。
-严格使用给定枚举，不要解释错误，不要复制原始代码，不要输出 Markdown。"""
+多轮与公开信息规则：
+1. 当前用户输入可能是在回答或纠正上一轮助手。助手上一轮提出的候选日期、场次和假设不是用户事实；
+   用户否定其前提后，必须按纠正后的含义更新 normalized_request，不得重复原追问。
+2. 只有用户独有且会实质改变执行的信息才需要 clarification_first。日期、公开赛事编号、题目列表等
+   可以由当前时间工具或网页搜索得到的信息，不得转嫁给用户补充。
+3. “这个周末/本周/上周/最新的 LeetCode 周赛”是可直接执行的公开信息检索与讲解请求。
+   “周赛”默认指 Weekly Contest；“双周赛”只有在用户明确提及时才成立。不得自行假设周六和周日
+   各有一场周赛，也不得要求用户提供可联网查到的场次编号。
+4. 对上述请求应保留 recent_messages，使用 knowledge_retrieval 能力，并把检索目标赛事、核验题号、
+   讲解题目写入 success_criteria；不确定的公开事实可写入 risk_flags，但不能设为阻塞性追问。"""
 
 
 class IntentRecognizer:
-    def __init__(self, model_client: IntentModelClient) -> None:
+    def __init__(
+        self,
+        model_client: IntentModelClient,
+        max_reflection_rounds: int = 10,
+    ) -> None:
         self.model_client = model_client
+        self.max_reflection_rounds = max_reflection_rounds
 
     async def recognize(
         self,
@@ -131,34 +139,76 @@ class IntentRecognizer:
             code_artifact,
             input_rewrite,
         )
-        user_prompt = json.dumps(request_payload, ensure_ascii=False)
-        raw_response, provider = await self.model_client.complete_json(
-            SYSTEM_PROMPT,
-            user_prompt,
-            on_retry,
+        task_spec, provider, _ = await complete_with_reflection(
+            model_client=self.model_client,
+            agent_name="意图识别 Agent",
+            system_prompt=SYSTEM_PROMPT,
+            request_payload=request_payload,
+            model_type=TaskSpec,
+            on_retry=on_retry,
+            max_tokens=1400,
+            max_reflection_rounds=self.max_reflection_rounds,
+            validator=lambda value: self._validate_task_spec(
+                value,
+                semantic_message,
+                history,
+            ),
         )
-        try:
-            task_spec = self._validate_task_spec(raw_response)
-        except (json.JSONDecodeError, ValidationError, ValueError, KeyError, TypeError) as error:
-            repair_payload = json.dumps(
-                {
-                    **request_payload,
-                    "previous_validation_error": str(error)[:800],
-                    "repair_instruction": "重新生成完整 TaskSpec，不要复用上一次损坏输出",
-                },
-                ensure_ascii=False,
-            )
-            repaired_response, repaired_provider = await self.model_client.complete_json(
-                REPAIR_PROMPT,
-                repair_payload,
-                on_retry,
-            )
-            task_spec = self._validate_task_spec(repaired_response)
-            provider = f"{repaired_provider}+schema-repair"
 
         if code_artifact is not None:
             task_spec = self._inject_code_artifact(task_spec, code_artifact)
         return task_spec, provider
+
+    @classmethod
+    def _validate_task_spec(
+        cls,
+        task_spec: TaskSpec,
+        message: str,
+        history: list[ConversationMessage],
+    ) -> None:
+        if not cls._is_relative_leetcode_contest_request(message, history):
+            return
+        if task_spec.response_mode == "clarification_first" or task_spec.clarifying_question:
+            raise ValueError(
+                "相对日期的 LeetCode 周赛属于可通过时间与网页搜索定位的公开事件；"
+                "不得追问周六/周日或要求用户提供场次编号。请按 Weekly Contest 重新生成可执行 TaskSpec"
+            )
+        normalized = task_spec.normalized_request
+        if "双周赛" not in message and (
+            ("周六" in normalized and "周日" in normalized)
+            or re.search(
+                r"\d{4}-\d{2}-\d{2}\s*(?:或|还是)\s*\d{4}-\d{2}-\d{2}",
+                normalized,
+            )
+        ):
+            raise ValueError(
+                "normalized_request 仍保留了已被用户否定的周六/周日二选一；"
+                "请将目标改为相对日期对应的 LeetCode Weekly Contest"
+            )
+
+    @staticmethod
+    def _is_relative_leetcode_contest_request(
+        message: str,
+        history: list[ConversationMessage],
+    ) -> bool:
+        recent = "\n".join(item.content for item in history[-6:])
+        combined = f"{recent}\n{message}".casefold()
+        has_leetcode = "leetcode" in combined or "力扣" in combined
+        has_contest = "周赛" in combined or "weekly contest" in combined
+        relative_terms = (
+            "这个周末",
+            "本周末",
+            "周末的",
+            "这周",
+            "本周",
+            "上周",
+            "最新",
+            "最近",
+        )
+        correction = "每周只有一次" in message or "就这个周末" in message
+        return has_leetcode and has_contest and (
+            any(term in combined for term in relative_terms) or correction
+        )
 
     def _build_request_payload(
         self,
@@ -189,12 +239,6 @@ class IntentRecognizer:
             )
         return payload
 
-    def _validate_task_spec(self, raw_response: str) -> TaskSpec:
-        parsed = self._extract_json(raw_response)
-        if isinstance(parsed.get("confidence"), (int, float)) and parsed["confidence"] > 1:
-            parsed["confidence"] = parsed["confidence"] / 100
-        return TaskSpec.model_validate(parsed)
-
     def _inject_code_artifact(self, task_spec: TaskSpec, artifact: CodeArtifact) -> TaskSpec:
         artifacts = task_spec.input_artifacts.model_copy(
             update={
@@ -215,15 +259,3 @@ class IntentRecognizer:
                 role="代码语言",
             ))
         return task_spec.model_copy(update={"input_artifacts": artifacts, "entities": entities})
-
-    @staticmethod
-    def _extract_json(raw_response: str) -> dict:
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_response.strip(), flags=re.IGNORECASE)
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start < 0 or end < start:
-            raise ValueError("模型没有返回有效的 JSON 对象")
-        value = json.loads(cleaned[start : end + 1])
-        if not isinstance(value, dict):
-            raise ValueError("意图识别结果必须是 JSON 对象")
-        return value

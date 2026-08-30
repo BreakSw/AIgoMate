@@ -29,6 +29,8 @@ public class AgentClient {
     private final ObjectMapper objectMapper;
     private final URI analyzeIntentUri;
     private final String retryStatusBaseUrl;
+    private final String progressStatusBaseUrl;
+    private final String ragOverviewBaseUrl;
 
     public AgentClient(@Value("${agent.service.base-url}") String baseUrl, ObjectMapper objectMapper) {
         this.httpClient = HttpClient.newBuilder()
@@ -38,20 +40,22 @@ public class AgentClient {
         this.objectMapper = objectMapper;
         this.analyzeIntentUri = URI.create(baseUrl + "/api/agent/analyze-intent");
         this.retryStatusBaseUrl = baseUrl + "/api/agent/sessions/";
+        this.progressStatusBaseUrl = baseUrl + "/api/agent/sessions/";
+        this.ragOverviewBaseUrl = baseUrl + "/api/rag/overview";
     }
 
-    public String respond(Long sessionId, String prompt, List<ChatMessage> history) {
+    public String respond(Long userId, Long sessionId, String prompt, List<ChatMessage> history) {
         try {
-            return analyzeIntent(sessionId, prompt, history).content();
+            return analyzeIntent(userId, sessionId, prompt, history).content();
         } catch (AgentServiceException exception) {
             log.warn("Agent service is unavailable: {}", exception.getMessage());
             return "意图识别服务暂时不可用，但你的消息已经安全保存。请检查模型配置后重试。";
         }
     }
 
-    public AgentResponse analyzeIntent(Long sessionId, String prompt, List<ChatMessage> history) {
+    public AgentResponse analyzeIntent(Long userId, Long sessionId, String prompt, List<ChatMessage> history) {
         try {
-            return analyzeIntentAsync(sessionId, prompt, history, null).join();
+            return analyzeIntentAsync(userId, sessionId, prompt, history, null).join();
         } catch (CompletionException exception) {
             Throwable cause = exception.getCause();
             if (cause instanceof AgentServiceException agentServiceException) {
@@ -62,6 +66,7 @@ public class AgentClient {
     }
 
     public CompletableFuture<AgentResponse> analyzeIntentAsync(
+            Long userId,
             Long sessionId,
             String prompt,
             List<ChatMessage> history,
@@ -72,21 +77,36 @@ public class AgentClient {
 
         try {
             String requestJson = objectMapper.writeValueAsString(
-                    new AgentRequest(sessionId, prompt, context, previousContextSnapshot));
+                    new AgentRequest(userId, sessionId, prompt, context, previousContextSnapshot));
             HttpRequest request = HttpRequest.newBuilder(analyzeIntentUri)
                     .timeout(Duration.ofMinutes(7))
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(requestJson, StandardCharsets.UTF_8))
                     .build();
-            return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
-                    .handle((response, failure) -> {
-                        if (failure != null) {
-                            throw new CompletionException(new AgentServiceException(
-                                    "Agent service connection failed",
-                                    failure));
-                        }
-                        return decodeAgentResponse(response);
-                    });
+            CompletableFuture<HttpResponse<String>> requestFuture = httpClient.sendAsync(
+                    request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            CompletableFuture<AgentResponse> resultFuture = new CompletableFuture<>();
+            requestFuture.whenComplete((response, failure) -> {
+                if (resultFuture.isCancelled()) {
+                    return;
+                }
+                if (failure != null) {
+                    resultFuture.completeExceptionally(new AgentServiceException(
+                            "Agent service connection failed", failure));
+                    return;
+                }
+                try {
+                    resultFuture.complete(decodeAgentResponse(response));
+                } catch (RuntimeException exception) {
+                    resultFuture.completeExceptionally(exception);
+                }
+            });
+            resultFuture.whenComplete((ignored, failure) -> {
+                if (resultFuture.isCancelled()) {
+                    requestFuture.cancel(true);
+                }
+            });
+            return resultFuture;
         } catch (JsonProcessingException exception) {
             return CompletableFuture.failedFuture(
                     new AgentServiceException("Agent payload could not be encoded", exception));
@@ -114,6 +134,54 @@ public class AgentClient {
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             throw new AgentServiceException("Retry status request was interrupted", exception);
+        }
+    }
+
+    public ProgressStatus getProgressStatus(Long sessionId) {
+        HttpRequest request = HttpRequest.newBuilder(
+                        URI.create(progressStatusBaseUrl + sessionId + "/progress-status"))
+                .timeout(Duration.ofSeconds(2))
+                .GET()
+                .build();
+        try {
+            HttpResponse<String> response = httpClient.send(
+                    request,
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                throw new AgentServiceException("Progress status endpoint returned HTTP " + response.statusCode());
+            }
+            return objectMapper.readValue(response.body(), ProgressStatus.class);
+        } catch (JsonProcessingException exception) {
+            throw new AgentServiceException("Progress status payload could not be decoded", exception);
+        } catch (IOException exception) {
+            throw new AgentServiceException("Progress status endpoint is unavailable", exception);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new AgentServiceException("Progress status request was interrupted", exception);
+        }
+    }
+
+    public JsonNode getRagOverview(Long userId) {
+        HttpRequest request = HttpRequest.newBuilder(
+                        URI.create(ragOverviewBaseUrl + "?user_id=" + userId))
+                .timeout(Duration.ofSeconds(8))
+                .GET()
+                .build();
+        try {
+            HttpResponse<String> response = httpClient.send(
+                    request,
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                throw new AgentServiceException("RAG overview endpoint returned HTTP " + response.statusCode());
+            }
+            return objectMapper.readTree(response.body());
+        } catch (JsonProcessingException exception) {
+            throw new AgentServiceException("RAG overview payload could not be decoded", exception);
+        } catch (IOException exception) {
+            throw new AgentServiceException("RAG overview endpoint is unavailable", exception);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new AgentServiceException("RAG overview request was interrupted", exception);
         }
     }
 
@@ -149,6 +217,7 @@ public class AgentClient {
     }
 
     public record AgentRequest(
+            Long userId,
             Long sessionId,
             String message,
             List<AgentMessage> history,
@@ -159,6 +228,15 @@ public class AgentClient {
             @JsonProperty("retry_count") int retryCount,
             @JsonProperty("max_retries") int maxRetries,
             @JsonProperty("retry_delay_seconds") Double retryDelaySeconds) {}
+    public record ProgressStatus(
+            long generation,
+            long sequence,
+            String phase,
+            String agent,
+            String message,
+            String detail,
+            String state,
+            @JsonProperty("updated_at") String updatedAt) {}
     public record AgentResponse(
             String content,
             String intent,

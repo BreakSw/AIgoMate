@@ -1,10 +1,10 @@
 import json
-import re
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
 from app.core.code_artifact import extract_code_artifact
 from app.core.model_client import IntentModelClient, RetryCallback
+from app.core.reflection import AgentProtocolExhaustedError, complete_with_reflection
 from app.models import CompressedContext, ConversationMessage, MemorySnapshot, TurnContext
 
 
@@ -51,9 +51,15 @@ class CompressionPayloadResult(BaseModel):
 
 
 class ContextCompressionAgent:
-    def __init__(self, model_client: IntentModelClient, model: str) -> None:
+    def __init__(
+        self,
+        model_client: IntentModelClient,
+        model: str,
+        max_reflection_rounds: int = 10,
+    ) -> None:
         self.model_client = model_client
         self.model = model
+        self.max_reflection_rounds = max_reflection_rounds
 
     async def compress(
         self,
@@ -71,16 +77,19 @@ class ContextCompressionAgent:
         }
         provider = "local-fallback"
         try:
-            raw, provider = await self.model_client.complete_json(
-                COMPRESSION_PROMPT,
-                json.dumps(payload, ensure_ascii=False),
-                on_retry,
+            result, provider, _ = await complete_with_reflection(
+                model_client=self.model_client,
+                agent_name="上下文压缩 Agent",
+                system_prompt=COMPRESSION_PROMPT,
+                request_payload=payload,
+                model_type=CompressionPayloadResult,
+                on_retry=on_retry,
                 max_tokens=1800,
+                max_reflection_rounds=self.max_reflection_rounds,
             )
-            result = CompressionPayloadResult.model_validate(self._extract_json(raw))
-        except (json.JSONDecodeError, ValidationError, ValueError, KeyError, TypeError):
+        except AgentProtocolExhaustedError as error:
             result = self._fallback(history)
-            provider = f"{provider}+deterministic-fallback"
+            provider = f"{error.provider}+reflection-exhausted+deterministic-fallback"
 
         memory = MemorySnapshot(
             current_goal=result.current_goal,
@@ -151,15 +160,3 @@ class ContextCompressionAgent:
                 if extract_code_artifact(item.content) is not None
             ],
         )
-
-    @staticmethod
-    def _extract_json(raw_response: str) -> dict:
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_response.strip(), flags=re.IGNORECASE)
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start < 0 or end < start:
-            raise ValueError("压缩模型没有返回有效 JSON")
-        value = json.loads(cleaned[start : end + 1])
-        if not isinstance(value, dict):
-            raise ValueError("压缩结果必须是 JSON 对象")
-        return value

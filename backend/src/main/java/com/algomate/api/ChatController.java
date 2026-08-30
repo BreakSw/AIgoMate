@@ -72,6 +72,13 @@ public class ChatController {
         return intentStreamService.stream(request.userId(), sessionId, request.content());
     }
 
+    @PostMapping("/sessions/{sessionId}/messages/stream/cancel")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void cancelStream(@PathVariable Long sessionId,
+                             @RequestParam(defaultValue = "1") Long userId) {
+        intentStreamService.cancel(userId, sessionId);
+    }
+
     @DeleteMapping("/sessions/{sessionId}")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void deleteSession(@PathVariable Long sessionId,

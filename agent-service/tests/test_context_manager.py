@@ -115,7 +115,8 @@ def test_small_turn_inserts_intent_without_calling_compression_model() -> None:
     assert snapshot.turn_context.primary_intent == "guided_hint"
     assert snapshot.memory.current_goal == "在不获取完整答案的情况下继续解题"
     assert "本轮意图：guided_hint" in snapshot.memory.working_memory
-    assert snapshot.memory.pinned_constraints == ["使用 Python", "只给提示"]
+    assert snapshot.memory.pinned_constraints == []
+    assert snapshot.turn_context.constraints == ["使用 Python", "只给提示"]
     assert snapshot.checkpoint_memory is None
     assert snapshot.window.turn_metadata_tokens > 0
     assert snapshot.window.compression_triggered is False
@@ -283,4 +284,4 @@ def test_compression_agent_falls_back_when_model_returns_invalid_json() -> None:
 
     assert "确定性摘要" in memory.working_memory[0]
     assert "user: 请记住后续都用 Python" in compressed.summary
-    assert compressed.compression_provider == "fake-provider+deterministic-fallback"
+    assert compressed.compression_provider == "fake-provider+reflection-exhausted+deterministic-fallback"

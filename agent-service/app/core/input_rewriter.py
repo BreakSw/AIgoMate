@@ -1,10 +1,8 @@
-import json
-import re
-
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
 from app.core.code_artifact import CodeArtifact, extract_code_artifact, normalize_language
 from app.core.model_client import IntentModelClient, RetryCallback
+from app.core.reflection import complete_with_reflection
 from app.models import ConversationMessage, InputRewriteResult
 
 
@@ -19,7 +17,7 @@ REWRITE_PROMPT = """你是算法学习平台的用户输入改写 Agent，位于
   "schema_version": "1.0",
   "input_type": "text | code | mixed",
   "formatted_input": "下游意图识别器应分析的完整规范输入，不复制代码全文",
-  "explicit_request": "用户明确或通过常用口语表达提出的操作要求",
+  "explicit_request": "用户明确或通过常用口语表达提出的操作要求；纯代码输入时为 null",
   "requested_operations": ["操作枚举"],
   "request_is_actionable": true,
   "instruction_verbatim": null,
@@ -39,22 +37,22 @@ REWRITE_PROMPT = """你是算法学习平台的用户输入改写 Agent，位于
 5. instruction_verbatim 必须逐字复制原始输入中的自然语言操作要求；若没有自然语言要求则为 null。不要把代码字符放入该字段。
 6. 历史只用于解析“继续、这个、之前”等指代，不得把历史助手建议伪造成新的用户要求。
 7. formatted_input 必须独立可读，并完整保留用户约束。
+8. 当前用户输入可能是在回答或纠正上一轮助手的追问。助手给出的候选项、日期和假设不是用户事实；
+   如果用户否定了追问前提，必须按用户纠正后的含义解析，不得继续复制已经被否定的候选项。
+9. “这个周末/本周/上周的 LeetCode 周赛”属于可通过时间与网页工具定位的公开赛事请求，
+   不是必须由用户提供场次编号的歧义。“周赛”默认指 Weekly Contest；只有用户明确说“双周赛”时才按
+   Biweekly Contest 处理，不得自行假设周六、周日各有一场周赛。
 
 操作枚举只能使用：general_code_review, explain_logic, find_bugs, analyze_complexity,
 optimize_code, solve_problem, explain_concept, provide_hint, compare_solutions,
 plan_learning, general_request。若用户只粘贴代码且完全没有自然语言要求，requested_operations 可为空且 request_is_actionable=false。"""
 
 
-REPAIR_PROMPT = REWRITE_PROMPT + """
-
-上一次输出未通过输入改写 JSON 校验。请重新生成完整 JSON，不要解释错误，不要输出 Markdown。"""
-
-
 class RewritePayload(BaseModel):
     schema_version: str = "1.0"
     input_type: str
     formatted_input: str
-    explicit_request: str
+    explicit_request: str | None = None
     requested_operations: list[str]
     request_is_actionable: bool
     instruction_verbatim: str | None = None
@@ -67,9 +65,15 @@ class RewritePayload(BaseModel):
 
 
 class UserInputRewriteAgent:
-    def __init__(self, model_client: IntentModelClient, model: str) -> None:
+    def __init__(
+        self,
+        model_client: IntentModelClient,
+        model: str,
+        max_reflection_rounds: int = 10,
+    ) -> None:
         self.model_client = model_client
         self.model = model
+        self.max_reflection_rounds = max_reflection_rounds
 
     async def rewrite(
         self,
@@ -81,36 +85,22 @@ class UserInputRewriteAgent:
             "active_context": [self._context_item(item) for item in active_context],
             "raw_user_input": raw_input,
         }
-        user_prompt = json.dumps(payload, ensure_ascii=False)
-        raw, provider = await self.model_client.complete_json(
-            REWRITE_PROMPT,
-            user_prompt,
-            on_retry,
+        parsed, provider, _ = await complete_with_reflection(
+            model_client=self.model_client,
+            agent_name="输入改写 Agent",
+            system_prompt=REWRITE_PROMPT,
+            request_payload=payload,
+            model_type=RewritePayload,
+            on_retry=on_retry,
             max_tokens=1100,
+            max_reflection_rounds=self.max_reflection_rounds,
+            validator=self._validate_payload,
         )
-        try:
-            parsed = self._validate(raw)
-        except (json.JSONDecodeError, ValidationError, ValueError, KeyError, TypeError) as error:
-            repair_payload = json.dumps(
-                {
-                    **payload,
-                    "previous_validation_error": str(error)[:600],
-                },
-                ensure_ascii=False,
-            )
-            repaired, provider = await self.model_client.complete_json(
-                REPAIR_PROMPT,
-                repair_payload,
-                on_retry,
-                max_tokens=1100,
-            )
-            parsed = self._validate(repaired)
-            provider = f"{provider}+schema-repair"
 
         return InputRewriteResult(
             input_type=parsed.input_type,
             formatted_input=parsed.formatted_input.strip(),
-            explicit_request=parsed.explicit_request.strip(),
+            explicit_request=(parsed.explicit_request or "").strip() or None,
             requested_operations=parsed.requested_operations,
             request_is_actionable=parsed.request_is_actionable,
             instruction_verbatim=(parsed.instruction_verbatim or "").strip() or None,
@@ -147,7 +137,7 @@ class UserInputRewriteAgent:
             code=artifact.code,
             programming_language=rewrite.programming_language or artifact.programming_language,
             instruction=rewrite.formatted_input,
-            is_code_only=not bool(rewrite.explicit_request.strip()),
+            is_code_only=not bool((rewrite.explicit_request or "").strip()),
         )
 
     @staticmethod
@@ -160,20 +150,11 @@ class UserInputRewriteAgent:
         return {"role": message.role, "content": content}
 
     @staticmethod
-    def _validate(raw_response: str) -> RewritePayload:
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_response.strip(), flags=re.IGNORECASE)
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start < 0 or end < start:
-            raise ValueError("输入改写 Agent 没有返回有效 JSON")
-        value = json.loads(cleaned[start : end + 1])
-        if not isinstance(value, dict):
-            raise ValueError("输入改写结果必须是 JSON 对象")
-        payload = RewritePayload.model_validate(value)
+    def _validate_payload(payload: RewritePayload) -> None:
         if payload.input_type not in {"text", "code", "mixed"}:
             raise ValueError("input_type 不在允许范围内")
-        if not payload.formatted_input.strip() or not payload.explicit_request.strip():
-            raise ValueError("formatted_input 和 explicit_request 不得为空")
+        if not payload.formatted_input.strip():
+            raise ValueError("formatted_input 不得为空")
         allowed_operations = {
             "general_code_review", "explain_logic", "find_bugs", "analyze_complexity",
             "optimize_code", "solve_problem", "explain_concept", "provide_hint",
@@ -185,4 +166,9 @@ class UserInputRewriteAgent:
             raise ValueError("存在自然语言要求时必须给出 requested_operations")
         if payload.instruction_verbatim and not payload.request_is_actionable:
             raise ValueError("自然语言操作要求不得被错误标记为不可执行")
-        return payload
+        if payload.request_is_actionable and not (payload.explicit_request or "").strip():
+            raise ValueError("可执行请求必须填写 explicit_request")
+        if payload.request_is_actionable and not payload.requested_operations:
+            raise ValueError("可执行请求必须给出 requested_operations")
+        if not payload.request_is_actionable and payload.requested_operations:
+            raise ValueError("不可执行输入不得声明 requested_operations")

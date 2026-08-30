@@ -1,8 +1,12 @@
 .idea/
 .vscode/
+.workbuddy/
 *.iml
 .DS_Store
 .env
+*.log
+__pycache__/
+*.py[cod]
 
 backend/target/
 backend/data/*.db*
@@ -11,6 +15,8 @@ agent-service/.venv/
 agent-service/__pycache__/
 agent-service/.pytest_cache/
 agent-service/**/*.pyc
+agent-service/data/
+agent-service/_verify_*.py
 
 frontend/node_modules/
 frontend/dist/
@@ -18,3 +24,13 @@ frontend/.env.local
 frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
+
+# Crawled source material, cleaned corpora and vector artifacts are generated
+# locally and may contain third-party content. Keep only the reproducible
+# pipeline, dataset documentation and hand-authored evaluation cases in Git.
+rag-data/raw/
+rag-data/processed/
+rag-data/vector/
+rag-data/collection-summary.json
+rag-data/evaluation/cache/
+rag-data/evaluation/reports/

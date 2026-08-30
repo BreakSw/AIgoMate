@@ -5,6 +5,7 @@ import java.util.List;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.server.ResponseStatusException;
 
 import com.algomate.api.ChatDtos.ConversationResponse;
@@ -31,19 +32,22 @@ public class ChatService {
     private final IntentAnalysisRepository intentAnalysisRepository;
     private final AgentClient agentClient;
     private final ObjectMapper objectMapper;
+    private final TransactionTemplate transactionTemplate;
 
     public ChatService(AppUserRepository userRepository,
                        ChatSessionRepository sessionRepository,
                        ChatMessageRepository messageRepository,
                        IntentAnalysisRepository intentAnalysisRepository,
                        AgentClient agentClient,
-                       ObjectMapper objectMapper) {
+                       ObjectMapper objectMapper,
+                       TransactionTemplate transactionTemplate) {
         this.userRepository = userRepository;
         this.sessionRepository = sessionRepository;
         this.messageRepository = messageRepository;
         this.intentAnalysisRepository = intentAnalysisRepository;
         this.agentClient = agentClient;
         this.objectMapper = objectMapper;
+        this.transactionTemplate = transactionTemplate;
     }
 
     @Transactional(readOnly = true)
@@ -69,23 +73,31 @@ public class ChatService {
         return new ConversationResponse(toSessionResponse(session), messages);
     }
 
-    @Transactional
+    /**
+     * 非流式发送。历史上该方法整体处于一个事务中，而 agent 调用最长可达数分钟，
+     * 会长期占用唯一的数据库连接，阻塞其他会话的一切读写。现在拆分为三段：
+     * 短事务保存用户消息 -> 无事务调用 agent -> 短事务保存回复。
+     */
     public ConversationResponse sendMessage(Long userId, Long sessionId, String content) {
+        PreparedIntent prepared = transactionTemplate.execute(
+                status -> prepareIntent(userId, sessionId, content));
+        String answer = agentClient.respond(userId, sessionId, prepared.prompt(), prepared.history());
+        return transactionTemplate.execute(
+                status -> completeSimpleAnswer(userId, sessionId, prepared.userMessageId(), answer));
+    }
+
+    private ConversationResponse completeSimpleAnswer(Long userId,
+                                                      Long sessionId,
+                                                      Long userMessageId,
+                                                      String answer) {
         ChatSession session = requireSession(userId, sessionId);
-        String prompt = content.trim();
-        long previousCount = messageRepository.countBySessionId(sessionId);
-
-        if (previousCount == 0) {
-            session.rename(titleFrom(prompt));
-        }
-
-        messageRepository.save(new ChatMessage(session, MessageRole.USER, prompt));
-        List<ChatMessage> history = messageRepository.findAllBySessionIdOrderByCreatedAtAsc(sessionId);
-        String answer = agentClient.respond(sessionId, prompt, history);
+        messageRepository.findById(userMessageId)
+                .filter(message -> message.getSession().getId().equals(sessionId)
+                        && message.getRole() == MessageRole.USER)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "用户消息不存在"));
         messageRepository.save(new ChatMessage(session, MessageRole.ASSISTANT, answer));
         session.touch();
         sessionRepository.save(session);
-
         return getConversation(userId, sessionId);
     }
 

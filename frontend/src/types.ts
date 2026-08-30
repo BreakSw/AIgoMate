@@ -91,11 +91,20 @@ export interface MemorySnapshot {
   resolved_items: string[]
 }
 
+export interface InputOrganizationResult {
+  schema_version: '1.0'
+  organized_input: string
+  input_shape: 'text' | 'code' | 'mixed' | 'unclassified'
+  organization_summary: string
+  organizer_model: string
+  organizer_provider: string
+}
+
 export interface InputRewriteResult {
   schema_version: '1.0'
   input_type: 'text' | 'code' | 'mixed'
   formatted_input: string
-  explicit_request: string
+  explicit_request?: string | null
   requested_operations: string[]
   request_is_actionable: boolean
   instruction_verbatim?: string | null
@@ -163,8 +172,115 @@ export interface ContextSnapshot {
   compressed_context: CompressedContext
   window: ContextWindowStatus
   turn_context?: TurnContext | null
+  input_organization?: InputOrganizationResult | null
   input_rewrite?: InputRewriteResult | null
+  agent_execution?: AgentExecutionTrace | null
   checkpoint_memory?: MemorySnapshot | null
+}
+
+export type KnowledgeCollection = 'algorithm_concepts' | 'problem_bank' | 'code_cases'
+
+export interface RagQuery {
+  collection: KnowledgeCollection
+  query: string
+  reason: string
+  top_k: number
+  required: boolean
+}
+
+export interface MemorySelection {
+  working_memory: boolean
+  long_term_memory: boolean
+  user_preferences: boolean
+  pinned_constraints: boolean
+  reason: string
+}
+
+export interface CoordinatorPlan {
+  schema_version: '1.0'
+  objective: string
+  selected_agent: string
+  task_instruction: string
+  planned_steps?: string[]
+  rag_queries?: RagQuery[]
+  memory_selection: MemorySelection
+  grounding_policy: 'no_rag' | 'prefer_rag' | 'require_rag'
+  requires_clarification: boolean
+  clarification_question?: string | null
+  known_limits: string[]
+  decision_trace: HeadDecision[]
+  web_search_queries?: string[]
+}
+
+export interface MemoryUpdate {
+  kind: string
+  content: string
+  importance: number
+  reason: string
+}
+
+export interface DurableMemoryItem {
+  memory_id: string
+  kind: string
+  content: string
+  importance: number
+  source: string
+  created_at: string
+  updated_at: string
+}
+
+export interface HeadDecision {
+  schema_version: '1.0'
+  iteration: number
+  rationale: string
+  action: 'retrieve_rag' | 'search_web' | 'delegate' | 'persist_memory' | 'ask_clarification' | 'finish'
+  selected_agent?: string | null
+  task_instruction?: string | null
+  rag_query?: RagQuery | null
+  web_query?: string | null
+  web_search_reason?: string | null
+  memory_updates: MemoryUpdate[]
+  clarification_question?: string | null
+  finish_reason?: string | null
+}
+
+export interface RagEvidence {
+  evidence_id: string
+  collection: KnowledgeCollection | 'web_search'
+  title: string
+  content: string
+  source_url?: string | null
+  score: number
+  metadata: Record<string, unknown>
+}
+
+export interface AgentWorkResult {
+  protocol_version: '1.0'
+  agent: string
+  draft_answer: string
+  used_evidence_ids: string[]
+  uncertainties: string[]
+  needs_follow_up: boolean
+}
+
+export interface PolishResult {
+  protocol_version: '1.0'
+  final_answer: string
+  preserved_uncertainties: string[]
+  style_changes: string[]
+  added_factual_claims: boolean
+}
+
+export interface AgentExecutionTrace {
+  protocol_version: '1.0'
+  task_spec: TaskSpec
+  coordinator_plan: CoordinatorPlan
+  rag_evidence: RagEvidence[]
+  work_result: AgentWorkResult
+  polish_result: PolishResult
+  durable_memory?: DurableMemoryItem[]
+  memory_updates?: MemoryUpdate[]
+  model_call_trace?: string[]
 }
 
 export interface IntentResult {
@@ -180,6 +296,59 @@ export interface IntentResult {
 export interface StreamStatus {
   phase: string
   message: string
+  sequence?: number
+  agent?: string
+  detail?: string
+  state?: 'active' | 'completed' | 'failed'
   retryCount?: number
   maxRetries?: number
+}
+
+export type RagLibraryKey = KnowledgeCollection | 'user_memory'
+
+export interface RagDistributionItem {
+  label: string
+  count: number
+}
+
+export interface RagDocumentSample {
+  document_id?: string | null
+  title: string
+  source_url?: string | null
+  metadata: Record<string, unknown>
+}
+
+export interface RagLibraryOverview {
+  key: RagLibraryKey
+  label: string
+  source: string
+  storage: string
+  retrieval_mode: string
+  documents: number
+  available_documents: number
+  chunks: number
+  tokens: number
+  model: string
+  dimension: number
+  collection: string
+  imported_rows: number
+  coverage: number
+  status: 'ready' | 'partial' | 'growing'
+  updated_at?: string | null
+  distribution: RagDistributionItem[]
+  samples: RagDocumentSample[]
+}
+
+export interface RagOverview {
+  status: 'ready' | 'partial'
+  storage: string
+  retrieval_mode: string
+  embedding_provider: string
+  generated_at?: string | null
+  quality_status: string
+  total_documents: number
+  total_chunks: number
+  total_tokens: number
+  paired_problem_cases: number
+  libraries: RagLibraryOverview[]
 }

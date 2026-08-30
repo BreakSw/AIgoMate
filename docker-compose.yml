@@ -1,0 +1,78 @@
+name: algomate
+
+services:
+  agent-service:
+    build:
+      context: .
+      dockerfile: agent-service/Dockerfile
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      USER_MEMORY_DIR: /app/agent-service/data/user-memory
+      MILVUS_URI: /app/rag-data/vector/algomate-milvus.db
+    volumes:
+      - agent-memory:/app/agent-service/data
+      - ./rag-data:/app/rag-data
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      AGENT_SERVICE_URL: http://agent-service:8000
+      SPRING_DATASOURCE_URL: "jdbc:sqlite:/app/data/algorithm-learning.db?journal_mode=WAL&busy_timeout=5000"
+    volumes:
+      - backend-data:/app/data
+    expose:
+      - "8898"
+    depends_on:
+      agent-service:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:8898/actuator/health
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "${ALGOMATE_HTTP_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  agent-memory:
+  backend-data:

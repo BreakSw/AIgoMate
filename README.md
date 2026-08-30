@@ -100,6 +100,7 @@ flowchart LR
 
 ```text
 algorithmMultiAgents/
+├─ docker-compose.yml         # 三服务容器编排与持久化卷
 ├─ frontend/                 # Vue 聊天工作台与 RAG 可视化
 ├─ backend/                  # Spring Boot REST/SSE 与 SQLite 业务层
 ├─ agent-service/            # FastAPI 多 Agent 编排服务
@@ -110,6 +111,69 @@ algorithmMultiAgents/
 ├─ rag-data/                 # 数据说明和人工黄金测试集
 └─ docs/                     # 架构与评测文档
 ```
+
+## Docker 一键部署（推荐）
+
+Docker 部署会启动三个容器：Nginx 托管 Vue 页面并代理 `/api`，Spring Boot 负责业务和 SQLite，FastAPI 负责多 Agent、记忆与 RAG。容器之间通过 Compose 内部网络通信，宿主机默认只开放 `8080` Web 端口。
+
+### 1. 准备配置
+
+安装 Docker Engine（或 Docker Desktop）及 Docker Compose 2，然后在仓库根目录创建配置文件：
+
+```powershell
+Copy-Item agent-service/.env.example .env
+```
+
+Linux 或 macOS 使用：
+
+```bash
+cp agent-service/.env.example .env
+```
+
+编辑 `.env`，至少填写：
+
+```dotenv
+DEEPSEEK_API_KEY=your_deepseek_key
+embedding-api-key=your_voyage_key
+serpapi-key=your_serpapi_key
+ALGOMATE_HTTP_PORT=8080
+```
+
+其中 DeepSeek Key 是对话必需配置；Voyage 和 SerpAPI 分别用于向量检索与网页搜索，不配置时对应能力会降级。若 `8080` 已被占用，可修改 `ALGOMATE_HTTP_PORT`。
+
+### 2. 构建并启动
+
+```bash
+docker compose up --detach --build
+```
+
+启动完成后访问 [http://localhost:8080](http://localhost:8080)。首次构建需要下载 Node、Maven、Java 和 Python 依赖，耗时取决于网络环境。
+
+常用管理命令：
+
+```bash
+docker compose ps
+docker compose logs --follow
+docker compose down
+```
+
+`docker compose down` 不会删除持久化数据；只有明确执行 `docker compose down --volumes` 才会同时删除 SQLite 数据和 Agent 私有记忆。
+
+### 3. 数据持久化与 RAG
+
+| 数据 | 容器位置 | 持久化方式 |
+| --- | --- | --- |
+| SQLite 会话数据库 | `/app/data` | `backend-data` 命名卷 |
+| 用户私有记忆 | `/app/agent-service/data` | `agent-memory` 命名卷 |
+| RAG 原文、清洗结果与 Milvus Lite | `/app/rag-data` | 宿主机 `./rag-data` 目录挂载 |
+
+出于版权和仓库体积考虑，Git 仓库不包含抓取正文及完整向量文件。因此，新克隆的项目可以运行对话主链路，但 RAG 会处于未就绪或文字降级状态。需要完整向量检索时，请先将已有 `rag-data/vector` 等本地产物复制到仓库的 `rag-data` 目录，或按照后文的 RAG 构建命令重新生成，再重启 `agent-service`：
+
+```bash
+docker compose restart agent-service
+```
+
+部署相关文件包括根目录的 `docker-compose.yml`、`.dockerignore`，以及三个服务目录中的 `Dockerfile`；前端生产环境由 `frontend/nginx.conf` 负责 SPA 路由、API 代理和 SSE 禁用缓冲。
 
 ## 本地启动
 

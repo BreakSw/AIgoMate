@@ -5,6 +5,7 @@ import LogoMark from './components/LogoMark.vue'
 import ContextInspector from './components/ContextInspector.vue'
 import MessageContent from './components/MessageContent.vue'
 import RagDashboard from './components/RagDashboard.vue'
+import ModelSettings from './components/ModelSettings.vue'
 import type { ChatMessage, ChatSession, ContextSnapshot } from './types'
 
 interface StreamState {
@@ -32,7 +33,8 @@ const error = ref('')
 const streams = ref(new Map<number, StreamState>())
 const streamControllers = new Map<number, AbortController>()
 const messageList = ref<HTMLElement | null>(null)
-const workspaceView = ref<'chat' | 'rag'>('chat')
+const workspaceView = ref<'chat' | 'rag' | 'settings'>('chat')
+const clearingConversation = ref(false)
 
 const activeSession = computed(() => sessions.value.find((item) => item.id === activeSessionId.value))
 const hasMessages = computed(() => messages.value.length > 0)
@@ -106,12 +108,50 @@ async function deleteSession(id: number) {
   }
 }
 
+async function clearConversation() {
+  const sessionId = activeSessionId.value
+  if (sessionId === null || clearingConversation.value) return
+  const confirmed = window.confirm(
+    '确定清空当前会话吗？\n\n将删除本会话的消息、上下文快照和会话记忆；跨会话学习画像会保留。此操作不可撤销。',
+  )
+  if (!confirmed) return
+
+  clearingConversation.value = true
+  error.value = ''
+  try {
+    const controller = streamControllers.get(sessionId)
+    if (controller) {
+      controller.abort()
+      await chatApi.cancelIntent(sessionId)
+      streamControllers.delete(sessionId)
+    }
+    streams.value.delete(sessionId)
+    const conversation = await chatApi.clearConversation(sessionId)
+    const index = sessions.value.findIndex((item) => item.id === sessionId)
+    if (index >= 0) sessions.value.splice(index, 1, conversation.session)
+    if (activeSessionId.value === sessionId) {
+      messages.value = []
+      draft.value = ''
+    }
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : '未知错误'
+    error.value = `清空会话失败：${detail}`
+  } finally {
+    clearingConversation.value = false
+  }
+}
+
 function chooseSuggestion(text: string) {
   draft.value = text
 }
 
 function openRagDashboard() {
   workspaceView.value = 'rag'
+  error.value = ''
+}
+
+function openModelSettings() {
+  workspaceView.value = 'settings'
   error.value = ''
 }
 
@@ -317,6 +357,17 @@ function previousActivities(stream: StreamState) {
         <b>→</b>
       </button>
 
+      <button
+        class="sidebar-tool model-settings-tool"
+        :class="{ active: workspaceView === 'settings' }"
+        type="button"
+        @click="openModelSettings"
+      >
+        <span class="settings-tool-icon" aria-hidden="true">⌘</span>
+        <span><strong>服务设置</strong><small>模型 · SerpAPI · Redis</small></span>
+        <b>→</b>
+      </button>
+
       <div class="sidebar-footer">
         <div class="avatar">学</div>
         <div><strong>算法学习者</strong><span>持续学习中</span></div>
@@ -330,7 +381,15 @@ function previousActivities(stream: StreamState) {
           <span class="eyebrow">当前探索</span>
           <h1>{{ activeSession?.title ?? '新的算法探索' }}</h1>
         </div>
-        <div class="memory-pill"><span></span> 上下文已保存</div>
+        <div class="topbar-actions">
+          <div class="memory-pill"><span></span> 上下文已保存</div>
+          <button
+            class="clear-conversation"
+            type="button"
+            :disabled="!activeSessionId || clearingConversation"
+            @click="clearConversation"
+          >{{ clearingConversation ? '正在清空…' : '清空对话' }}</button>
+        </div>
       </header>
 
       <section ref="messageList" class="conversation" aria-live="polite">
@@ -420,6 +479,7 @@ function previousActivities(stream: StreamState) {
         <p>{{ activeStream ? '点击停止按钮可暂停本次生成 · 已有对话不会丢失' : 'Enter 发送 · Shift + Enter 换行 · 学习记录将保存到本地数据库' }}</p>
       </div>
     </main>
+    <ModelSettings v-else-if="workspaceView === 'settings'" />
     <RagDashboard v-else />
   </div>
 </template>

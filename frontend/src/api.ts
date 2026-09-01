@@ -1,4 +1,12 @@
-import type { ChatSession, Conversation, IntentResult, RagOverview, StreamStatus } from './types'
+import type {
+  ChatSession,
+  Conversation,
+  IntentResult,
+  ModelConfigInput,
+  ModelConfigStatus,
+  RagOverview,
+  StreamStatus,
+} from './types'
 
 const USER_ID = 1
 
@@ -8,12 +16,33 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
     ...options,
   })
   if (!response.ok) {
-    throw new Error(`请求失败（${response.status}）`)
+    const body = await response.json().catch(() => null) as { detail?: string } | null
+    throw new Error(body?.detail || `请求失败（${response.status}）`)
   }
   return response.json() as Promise<T>
 }
 
 export const chatApi = {
+  getModelConfig: () => request<ModelConfigStatus>('/api/model-config'),
+  saveModelConfig: (payload: ModelConfigInput) =>
+    request<ModelConfigStatus>('/api/model-config', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  deleteModelConfig: async () => {
+    const response = await fetch('/api/model-config', {
+      method: 'DELETE',
+    })
+    if (!response.ok) throw new Error(`删除模型配置失败（${response.status}）`)
+  },
+  deleteModelConnection: async () => {
+    const response = await fetch('/api/model-config/model', { method: 'DELETE' })
+    if (!response.ok) throw new Error(`删除模型连接失败（${response.status}）`)
+  },
+  deleteSearchConnection: async () => {
+    const response = await fetch('/api/model-config/search', { method: 'DELETE' })
+    if (!response.ok) throw new Error(`删除搜索配置失败（${response.status}）`)
+  },
   getRagOverview: () => request<RagOverview>(`/api/rag/overview?userId=${USER_ID}`),
   listSessions: () => request<ChatSession[]>(`/api/sessions?userId=${USER_ID}`),
   createSession: (title?: string) =>
@@ -90,7 +119,14 @@ export const chatApi = {
     if (!response.ok) throw new Error(`暂停失败（${response.status}）`)
   },
   deleteSession: async (sessionId: number) => {
-    const response = await fetch(`/api/sessions/${sessionId}?userId=${USER_ID}`, { method: 'DELETE' })
+    const response = await fetch(`/api/sessions/${sessionId}?userId=${USER_ID}`, {
+      method: 'DELETE',
+    })
     if (!response.ok) throw new Error(`删除失败（${response.status}）`)
   },
+  clearConversation: (sessionId: number) =>
+    request<Conversation>(
+      `/api/sessions/${sessionId}/content?userId=${USER_ID}`,
+      { method: 'DELETE' },
+    ),
 }

@@ -24,7 +24,10 @@ public class AppConfig {
                                 "http://127.0.0.1:5173",
                                 "http://localhost:5174",
                                 "http://127.0.0.1:5174")
-                        .allowedMethods("GET", "POST", "DELETE", "OPTIONS");
+                        .allowedHeaders(
+                                "Content-Type",
+                                "Accept")
+                        .allowedMethods("GET", "POST", "PUT", "DELETE", "OPTIONS");
             }
         };
     }

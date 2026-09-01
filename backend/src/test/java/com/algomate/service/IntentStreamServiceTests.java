@@ -49,7 +49,8 @@ class IntentStreamServiceTests {
         PreparedIntent prepared = new PreparedIntent(7L, 11L, "学习二分查找", List.of(), null);
 
         when(chatService.prepareIntent(1L, 7L, "学习二分查找")).thenReturn(prepared);
-        when(agentClient.analyzeIntentAsync(eq(1L), eq(7L), eq("学习二分查找"), any(), any()))
+        when(agentClient.analyzeIntentAsync(
+                eq(1L), eq(7L), eq("学习二分查找"), any(), any()))
                 .thenAnswer(ignored -> {
                     agentStarted.countDown();
                     return agentFuture;

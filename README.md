@@ -10,6 +10,7 @@ AlgoMate 是一个基于 **Vue 3 + Spring Boot + FastAPI** 的多智能体算法
 - **结构化意图识别**：输入整理、指代改写和 TaskSpec 识别分层执行，为后续 Agent 提供目标、约束、交付格式和所需能力。
 - **上下文预算与压缩**：默认使用 32K 上下文窗口，保留输出预算；只有活跃上下文超过安全阈值时才创建统一压缩检查点。
 - **会话级私有记忆**：偏好、目标、约束、学习事实和未完成任务按照 `user_id + session_id` 隔离存储，避免不同对话串线。
+- **部署级服务配置**：用户在前端分别保存 OpenAI 兼容模型连接与 SerpAPI Key；两类凭据可独立新增、更新和删除，无登录模式下作为当前部署的全局配置加密存入 Redis并支持自定义 TTL，业务 Key 不进入 `.env`、SQLite 或聊天记录。
 - **三库 RAG**：算法概念库、题库和代码案例库分别建库，使用 Voyage Embedding 和 Milvus 向量检索；用户记忆作为动态增长的第四类知识源。
 - **时效信息检索**：通过 SerpAPI 搜索外部资料，并提供当前时间工具；证据不足时由首脑 Agent 重新规划可交付的替代内容。
 - **SSE 流式体验**：Spring Boot 统一承接业务请求，向前端推送 Agent 进度、断线重试状态和最终回答。
@@ -24,6 +25,7 @@ flowchart LR
     V -->|REST / SSE| B[Spring Boot 业务服务<br/>:8898]
     B --> S[(SQLite<br/>用户 / 会话 / 消息)]
     B --> A[FastAPI Agent Service<br/>:8000]
+    A --> KV[(Redis<br/>加密模型与搜索配置 / TTL)]
 
     A --> I[输入整理与意图识别]
     I --> C[首脑 Agent]
@@ -92,7 +94,7 @@ flowchart LR
 | 前端 | Vue 3、TypeScript、Vite |
 | 业务后端 | Java 21、Spring Boot 3.4、Spring Data JPA、SSE |
 | Agent 服务 | Python、FastAPI、Pydantic、异步 HTTP |
-| 数据存储 | SQLite、Milvus Lite |
+| 数据存储 | SQLite、Redis、Milvus Lite |
 | 模型与检索 | DeepSeek、Voyage Embedding/Rerank、SerpAPI |
 | 测试 | Pytest、Spring Boot Test、Vue Type Check、Vite Build |
 
@@ -114,7 +116,7 @@ algorithmMultiAgents/
 
 ## Docker 一键部署（推荐）
 
-Docker 部署会启动三个容器：Nginx 托管 Vue 页面并代理 `/api`，Spring Boot 负责业务和 SQLite，FastAPI 负责多 Agent、记忆与 RAG。容器之间通过 Compose 内部网络通信，宿主机默认只开放 `8080` Web 端口。
+Docker 部署会启动四个容器：Nginx 托管 Vue 页面并代理 `/api`，Spring Boot 负责业务和 SQLite，FastAPI 负责多 Agent、记忆与 RAG，Redis 保存当前部署的全局加密模型与 SerpAPI 配置。容器之间通过 Compose 内部网络通信，宿主机默认只开放 `8080` Web 端口，Redis 不开放公网端口。
 
 ### 1. 准备配置
 
@@ -130,16 +132,21 @@ Linux 或 macOS 使用：
 cp agent-service/.env.example .env
 ```
 
-编辑 `.env`，至少填写：
+编辑 `.env`，至少替换下面两个服务器端安全参数：
 
 ```dotenv
-DEEPSEEK_API_KEY=your_deepseek_key
-embedding-api-key=your_voyage_key
-serpapi-key=your_serpapi_key
+REDIS_PASSWORD=replace_with_a_strong_redis_password
+MODEL_CONFIG_ENCRYPTION_KEY=replace_with_at_least_24_random_characters
 ALGOMATE_HTTP_PORT=8080
 ```
 
-其中 DeepSeek Key 是对话必需配置；Voyage 和 SerpAPI 分别用于向量检索与网页搜索，不配置时对应能力会降级。若 `8080` 已被占用，可修改 `ALGOMATE_HTTP_PORT`。
+`MODEL_CONFIG_ENCRYPTION_KEY` 用于加密 Redis 中的服务配置，生产环境应使用随机且不可复用的长字符串。模型 API Key、模型名称、API URL 和 SerpAPI Key 不再写入 `.env`，启动后由使用者在前端“模型设置”页面填写。Voyage 仍用于向量检索；SerpAPI 未配置时网页搜索能力会降级。若 `8080` 已被占用，可修改 `ALGOMATE_HTTP_PORT`。
+
+可以用 Python 生成随机加密密钥，再复制到 `.env`：
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
 
 ### 2. 构建并启动
 
@@ -165,6 +172,7 @@ docker compose down
 | --- | --- | --- |
 | SQLite 会话数据库 | `/app/data` | `backend-data` 命名卷 |
 | 用户私有记忆 | `/app/agent-service/data` | `agent-memory` 命名卷 |
+| 加密模型配置与过期时间 | `/data` | `redis-data` 命名卷 |
 | RAG 原文、清洗结果与 Milvus Lite | `/app/rag-data` | 宿主机 `./rag-data` 目录挂载 |
 
 出于版权和仓库体积考虑，Git 仓库不包含抓取正文及完整向量文件。因此，新克隆的项目可以运行对话主链路，但 RAG 会处于未就绪或文字降级状态。需要完整向量检索时，请先将已有 `rag-data/vector` 等本地产物复制到仓库的 `rag-data` 目录，或按照后文的 RAG 构建命令重新生成，再重启 `agent-service`：
@@ -192,15 +200,17 @@ docker compose restart agent-service
 Copy-Item agent-service/.env.example .env
 ```
 
-至少配置：
+至少配置 Redis 连接和配置加密密钥：
 
 ```dotenv
-DEEPSEEK_API_KEY=your_deepseek_key
-embedding-api-key=your_voyage_key
-serpapi-key=your_serpapi_key
+REDIS_URL=redis://127.0.0.1:6379/0
+REDIS_PASSWORD=your_redis_password
+MODEL_CONFIG_ENCRYPTION_KEY=your_random_encryption_secret
 ```
 
-`.env` 已被 Git 忽略，请勿提交真实密钥。
+`.env` 已被 Git 忽略，请勿提交真实密钥。Agent Service 不再从 `.env` 读取大模型或 SerpAPI Key；Redis 可用后，在前端“模型设置”页面填写模型连接和搜索凭据。若需要限制公网用户可填写的模型地址，可设置逗号分隔的 `MODEL_BASE_URL_ALLOWED_HOSTS=api.deepseek.com,api.openai.com`。
+
+本地运行 Agent Service 前，需要确保 Redis 7+ 已启动且 `REDIS_URL`、`REDIS_PASSWORD` 与实际服务一致；Redis 不可用时，模型配置页面和 Agent 模型调用会明确返回不可用状态。
 
 ### 2. 启动 Agent Service（8000）
 
@@ -243,6 +253,9 @@ npm run dev -- --mode integration --host 127.0.0.1
 - `POST /api/sessions/{id}/messages/stream/cancel`：取消当前流式任务。
 - `DELETE /api/sessions/{id}?userId=1`：删除会话。
 - `GET /api/rag/overview`：获取 RAG 可视化数据。
+- `GET /api/model-config`：读取当前部署全局模型配置的掩码与剩余时间。
+- `PUT /api/model-config`：加密保存模型 URL、名称、API Key 和 TTL。
+- `DELETE /api/model-config`：立即删除当前部署的全局模型配置。
 
 ### Agent Service
 
@@ -252,6 +265,18 @@ npm run dev -- --mode integration --host 127.0.0.1
 - `GET /api/agent/sessions/{id}/retry-status`：查看模型重试状态。
 - `GET /api/agent/sessions/{id}/progress-status`：查看 Agent 执行进度。
 - `GET /api/rag/overview`：读取本地 RAG 与私有记忆概览。
+- `GET/PUT/DELETE /api/model-config`：读取、局部更新或整体删除 Redis 服务配置。
+- `DELETE /api/model-config/model`、`DELETE /api/model-config/search`：分别删除模型连接或 SerpAPI 配置，不影响另一项。
+
+## 前端服务设置
+
+1. 打开左侧“模型设置”。
+2. 模型连接与 SerpAPI Key 使用各自的保存按钮；补录或更新其中一项时，不需要重新输入另一项。
+3. 自行设置 5 分钟至 30 天的保存时间，保存后状态会显示两个 Key 的配置状态、掩码和自动过期时间。
+4. 返回聊天页面发送问题；每次 Agent 请求都会直接从 Redis 解密并装载当前部署的全局模型配置。
+5. 配置过期后需要重新填写，也可以在设置页面点击“立即删除”。
+
+浏览器不保存 API Key 或配置访问令牌，服务器只返回 Key 掩码。模型和 SerpAPI 凭据可独立更新与删除，合并后整体加密存储在固定 Redis 全局键中并共享同一 TTL；重启服务或切换本地域名不会改变配置，Redis 会在 TTL 到期后自动清除它。该模式适合当前无登录的单用户/可信部署；公网多用户部署应先增加身份认证和用户级配置隔离。模型服务必须兼容 OpenAI `/chat/completions` 接口和 JSON 输出。
 
 ## RAG 构建与评测
 
@@ -298,6 +323,7 @@ npm run build
 ## 数据与安全说明
 
 - 不提交 `.env`、数据库、模型缓存、运行日志和本地向量文件。
+- 大模型与 SerpAPI Key 不从 `.env` 读取、不写入 SQLite；它们与 URL、Model ID 一起加密保存到不暴露公网端口的 Redis，并由 TTL 自动删除。
 - 网页正文仅用于本地学习与检索实验；使用和分发时应遵守来源网站的条款与版权要求。
 - 网页搜索结果和 RAG 文档均作为不可信证据处理，不能覆盖系统提示词或直接充当工具指令。
 

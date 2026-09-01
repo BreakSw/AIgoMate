@@ -1,9 +1,10 @@
 import asyncio
-import calendar
 import html
+import json
 import re
 from datetime import date, datetime, timezone
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, Field
@@ -15,12 +16,6 @@ from app.core.reflection import complete_with_reflection
 from app.models import RagEvidence
 
 
-class WebSearchPlan(BaseModel):
-    query: str = Field(min_length=1, max_length=500)
-    relevance_criteria: list[str] = Field(default_factory=list)
-    freshness_required: bool = False
-
-
 WebSearchSource = Literal[
     "answer_box",
     "knowledge_graph",
@@ -28,6 +23,16 @@ WebSearchSource = Literal[
     "bilibili_video",
     "leetcode_official",
 ]
+WebSearchProvider = Literal["serpapi", "bilibili", "leetcode_graphql"]
+
+
+class WebSearchPlan(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+    provider: WebSearchProvider = "serpapi"
+    target_date: date | None = None
+    contest_number: int | None = Field(default=None, ge=1)
+    relevance_criteria: list[str] = Field(default_factory=list)
+    freshness_required: bool = False
 
 
 class WebSearchResult(BaseModel):
@@ -47,22 +52,72 @@ class WebSearchError(RuntimeError):
     """SerpAPI 返回了明确错误（如无效密钥、配额耗尽），不应继续重试。"""
 
 
-SYSTEM_PROMPT = """你是网页搜索 Agent 的查询规划器。根据首脑给出的任务和搜索原因，生成一个精确、单次可执行的网页搜索查询。
-不要回答问题，不要假设搜索结果，不要添加用户未要求的主题。
-请求载荷中的 current_date 是当前日期。遇到“今天、今日、每日一题、最新”等相对时间要求，查询中必须写入明确日期。
-查询 LeetCode 每日一题时，同时包含 LeetCode Daily Challenge、明确日期和 solution，便于检索题目与解法来源。
-查询 LeetCode 周赛时，“周赛”指 Weekly Contest，“双周赛”指 Biweekly Contest，不得混淆。
-若首脑要定位目标周赛，优先保留或生成 `site:bilibili.com 灵茶山艾府 LeetCode 周赛 明确日期`，
-用灵神最新解析的视频标题或摘要定位周赛编号和题号；若首脑要核验题号，则保留或生成
-`site:leetcode.cn 周赛编号 题号`，以官方题目页为准。
-requested_query 已包含 site:、作者名、周赛编号或题号时必须保留这些限定，不得泛化成普通搜索。
-用户未指定版本时，LeetCode 搜索默认限定中国版 `site:leetcode.cn`，不得擅自替换成 `leetcode.com`。
-只有 requested_query 明确要求国际版，或搜索原因明确说明中国版已无可用结果时，才允许查询 `.com`。
-中国版和国际版的题号、标题与发布状态必须按来源分别记录，不得把国际版 questionId 映射成中国版题号；
-若只能取得国际版资料，relevance_criteria 必须要求结果标注“国际版”，查询与证据链接保留 `.com` 域名。
+SYSTEM_PROMPT = """你是 AlgoMate 的网页搜索查询规划 Agent。首脑只描述本轮要查明的信息；你负责选择最合适的
+搜索工具并生成一次可执行的调用计划。你不回答用户问题、不虚构搜索结果、不执行第二个工具，也不把常见流程写死。
+
+一、工具边界与选择
+- bilibili：通过 B站公开搜索接口查找视频和作者投稿，适合从标题、摘要、作者与发布日期中定位线索。query 使用
+  B站站内可理解的纯关键词，例如 `灵茶山艾府 LeetCode 周赛 2026-08-30`；不要使用 site: 操作符。无需 SerpAPI Key。
+- leetcode_graphql：通过 LeetCode 官方 GraphQL 核验 Weekly Contest 官方题单，优先中国站；若中国站被访问保护拦截，
+  可回退国际站官方接口，并在证据中保留实际域名。只适用于周赛官方题单，不适用于
+  每日一题、普通题目题解、博客或任意 LeetCode 页面。必须提供 contest_number 或 target_date；query 仅用于审计。
+- serpapi：检索普通 HTTPS 网页、官方文档、第三方教程、新闻、Daily Challenge、普通 LeetCode 页面以及其他站点。
+  query 可使用 site:、引号、版本号和日期等搜索限定，需要用户在 Redis 中配置 SerpAPI Key。
+
+每次只能选择一个 provider。选择依据是本轮搜索目的，而不是单个关键词：出现“LeetCode”不等于使用 GraphQL，
+出现“视频”也不等于一定使用 B站。如果 requested_query 含站点、作者、题号、版本或日期限定，应保留其语义；只有
+当 provider=bilibili 时移除不适用的 site:bilibili.com 操作符。禁止在一个 query 中混写两个工具的调用意图。
+
+二、时间与版本
+- current_date 是应用当前日期。把“今天、昨天、本周、上周、这个周末、最近、最新”等相对表达换算为可审计的
+  绝对日期或日期范围；若首脑已给绝对日期，以首脑提供的日期为准。不得依据模型记忆猜赛事编号或发布日期。
+- freshness_required 仅在结果会随时间变化时设为 true，例如当天题目、最新版本、新闻和近期赛事；稳定概念设为 false。
+- 用户未指定版本时，“LeetCode/力扣”默认中国站。SerpAPI 查询优先加 `site:leetcode.cn`；GraphQL 优先中国站，只有
+  中国站接口被 403 等访问保护拦截时才使用国际站同一官方接口，并在 relevance_criteria 中要求标记实际域名。
+  禁止把两站的 questionId、标题、发布日期或 titleSlug 自行映射。
+
+三、LeetCode 常见场景
+- 周赛与双周赛严格区分：“周赛”是 Weekly Contest；只有用户明确说“双周赛”才按 Biweekly Contest。
+- 用户询问“上周/本周/最新周赛”，且本轮目标是取得官方赛题列表时，只要目标日期已经明确，优先选择
+  leetcode_graphql 并填写 target_date；官方工具可以由日期解析 Weekly Contest，不必先知道场次编号。
+- 只有本轮目标明确是寻找灵茶山艾府解析、B站视频，或需要用第三方标题辅助定位场次时才选择 bilibili。B站站内
+  query 使用稳定关键词 `灵茶山艾府 力扣周赛`，不要把 `YYYY-MM-DD` 当作必须命中的搜索词；目标日期写入
+  relevance_criteria，通过结果的 published_date 判断哪条视频对应目标周赛。
+- 当 requested_query 或 reason 已包含上一轮证据确认的周赛编号，且本轮目标是核验官方赛题时，选择
+  leetcode_graphql 并填写 contest_number；若只有可靠目标日期，可填写 target_date 让官方接口解析对应 Weekly Contest。
+- B站结果只作为定位线索，LeetCode GraphQL 才是当前周赛题单的官方核验来源。用户同时需要题目和第三方解析时，
+  先取得官方题单，首脑读完证据后再决定是否搜索对应场次的解析；
+  你只规划当前一轮，绝不能自行串联 bilibili → leetcode_graphql。
+- 已有官方题单后，若本轮目标是寻找每题解析、C++ 实现或灵茶山艾府（EndlessCheng）的做法，不能再选择
+  leetcode_graphql，因为该接口只提供题面而不提供第三方题解。优先选择 serpapi，查询应包含已确认的场次/题号/
+  titleSlug、`灵茶山艾府` 或 `EndlessCheng`、`题解`、所需语言，并优先限定 `site:leetcode.cn/problems`；若目标明确是
+  找灵神的周赛讲解视频才选择 bilibili。SerpAPI 结果必须能从标题、URL 或摘要确认作者与目标题号，不能只因关键词相似采用。
+- B站视频摘要通常不含完整算法与代码。它可以确认“灵神讲过哪场/哪些题”，但用户要求可复制实现时还应由首脑根据
+  已核验官方题面独立生成和验证代码，或继续寻找实际包含题解正文的 LeetCode/官方页面；不得把视频标题冒充代码证据。
+- “每日一题”不是周赛。查询每日一题时选择 serpapi，加入 `LeetCode Daily Challenge`、明确日期、`solution` 和
+  `site:leetcode.cn`。摘要若缺少明确日期、题号或标题及来源，应在 relevance_criteria 中判定为不足以核验。
+
+四、其他常见搜索
+- 用户指定 URL 或域名：保留域名和页面主题；用 SerpAPI 定位该页或同域官方资料。搜索摘要不等于读过网页正文，
+  relevance_criteria 应要求标题、URL 和摘要确实支持目标事实。
+- 框架/API/模型版本：查询中保留准确产品名、版本号、语言和发布日期，优先官方文档或发布说明。
+- 报错诊断：保留最有辨识度的原始错误文本并用引号包裹，同时加入框架、版本和运行环境；不要把整段密钥或隐私数据放入查询。
+- 算法题：已有完整题面或代码且只需推理时通常无需搜索；若首脑仍要求搜索，只查询缺失的官方约束、题号或权威资料，
+  不要把问题泛化为宽泛的“算法教程”。
+- 搜索第三方解析时，relevance_criteria 应要求结果与目标题号、场次、日期和作者相符；不得凭标题相似拼接事实。
+
+五、计划质量
+- query 要短而有区分度，通常包含主题实体、要核验的字段、日期/版本和必要站点限制；不要堆叠同义词。
+- relevance_criteria 写 1 到 4 条可从返回结果验证的条件，不要写无法由摘要或该工具证明的要求。
+- 若当前工具无法满足搜索目的，仍选择最接近的 provider，并通过 relevance_criteria 限定证据边界；不要伪造能力。
+- provider=leetcode_graphql 时，contest_number 与 target_date 至少一个非空；已有已核验场次优先编号，未知时不得臆造。
+
 只返回 JSON：
 {
   "query": "优化后的搜索查询",
+  "provider": "serpapi | bilibili | leetcode_graphql",
+  "target_date": "YYYY-MM-DD 或 null",
+  "contest_number": "已由上游证据确认的周赛编号，未知时为 null",
   "relevance_criteria": ["结果必须满足的条件"],
   "freshness_required": false
 }"""
@@ -84,13 +139,10 @@ class WebSearchAgent:
         )
 
     def available(self) -> bool:
-        return bool(
-            self.settings.web_search_enabled
-            and self.settings.serpapi_api_key is not None
-            # 空字符串密钥（如 .env 中写了 serpapi-key=）不算可用，
-            # 否则每轮搜索都会触发 401。
-            and self.settings.serpapi_api_key.get_secret_value().strip()
-        )
+        # Bilibili public search and LeetCode CN GraphQL remain usable without
+        # a SerpAPI credential. The model-selected provider is checked inside
+        # search(), after the query planner has made an explicit tool choice.
+        return self.settings.web_search_enabled
 
     async def search(
         self,
@@ -117,17 +169,31 @@ class WebSearchAgent:
                 on_retry=on_retry,
                 max_tokens=800,
                 max_reflection_rounds=self.max_reflection_rounds,
+                validator=self._validate_plan,
             )
-            search_query = self._make_date_aware(plan.query)
-            if self._is_bilibili_query(search_query):
+            search_query = plan.query.strip()
+            if plan.provider == "bilibili":
                 search_backend = "bilibili"
                 response = await self._bilibili_search(search_query)
                 results = self._extract_bilibili_results(response)
-            elif self._is_leetcode_contest_query(search_query):
-                search_backend = "leetcode-graphql"
-                response = await self._leetcode_contest_search(search_query)
+            elif plan.provider == "leetcode_graphql":
+                response = await self._leetcode_contest_search(
+                    plan.contest_number,
+                    plan.target_date,
+                )
+                official_host = urlsplit(
+                    str(response.get("official_base_url") or "https://leetcode.cn")
+                ).hostname
+                search_backend = (
+                    "leetcode-com-graphql"
+                    if official_host == "leetcode.com"
+                    else "leetcode-cn-graphql"
+                )
                 results = self._extract_leetcode_contest_results(response)
             else:
+                key = self.model_client.current_serpapi_api_key
+                if not key or not key.strip():
+                    raise WebSearchError("当前 Redis 配置未提供 SerpAPI Key")
                 response = await self._serpapi_search(
                     search_query,
                     freshness_required=plan.freshness_required,
@@ -139,7 +205,11 @@ class WebSearchAgent:
             # 返回 serpapi-error 前缀，供 adaptive_runtime 记入 known_limits 并继续执行。
             return [], f"{search_backend}-error:{type(error).__name__}"
         evidence: list[RagEvidence] = []
-        for item in results[: self.settings.web_search_max_results]:
+        ranked_results = [
+            item.model_copy(update={"rank": rank})
+            for rank, item in enumerate(results, start=1)
+        ]
+        for item in ranked_results[: self.settings.web_search_max_results]:
             evidence.append(RagEvidence(
                 evidence_id=f"W{item.rank}",
                 collection="web_search",
@@ -165,50 +235,27 @@ class WebSearchAgent:
         return evidence, f"{provider}+{search_backend}"
 
     @staticmethod
-    def _is_bilibili_query(query: str) -> bool:
-        lowered = query.casefold()
-        return any(
-            marker in lowered
-            for marker in (
-                "site:bilibili.com",
-                "bilibili",
-                "哔哩哔哩",
-                "b站",
-                "灵茶山艾府",
-                "灵神",
+    def _validate_plan(plan: WebSearchPlan) -> None:
+        if plan.provider == "leetcode_graphql" and (
+            plan.contest_number is None and plan.target_date is None
+        ):
+            raise ValueError(
+                "leetcode_graphql 需要 contest_number 或 target_date"
             )
-        )
 
     @staticmethod
     def _bilibili_keyword(query: str) -> str:
-        contest_number = re.search(
-            r"(?:周赛|weekly\s+contest)\s*#?\s*(\d{2,3})(?![-\d])",
+        # Only remove a web-search operator that the Bilibili site search does
+        # not understand. The model owns the semantic keywords.
+        return re.sub(
+            r"(?:^|\s)site:bilibili\.com(?=\s|$)",
+            " ",
             query,
-            re.IGNORECASE,
-        )
-        if contest_number:
-            return f"LeetCode 周赛 {contest_number.group(1)}"
-        if "双周赛" in query or "biweekly contest" in query.casefold():
-            return "LeetCode 双周赛"
-        return "LeetCode 周赛"
-
-    @staticmethod
-    def _is_leetcode_contest_query(query: str) -> bool:
-        lowered = query.casefold()
-        return (
-            ("leetcode" in lowered or "力扣" in lowered)
-            and (
-                "周赛" in lowered
-                or "weekly contest" in lowered
-                or "weekly-contest" in lowered
-            )
-            and "双周赛" not in lowered
-            and "biweekly contest" not in lowered
-            and "biweekly-contest" not in lowered
-        )
+            flags=re.IGNORECASE,
+        ).strip()
 
     async def _bilibili_search(self, query: str) -> dict[str, Any]:
-        """读取 B 站公开搜索结果；只保留灵茶山艾府投稿由解析阶段完成。"""
+        """读取 B 站公开搜索结果；语义筛选由模型查询和后续首脑判断完成。"""
         params = {
             "search_type": "video",
             "keyword": self._bilibili_keyword(query),
@@ -250,9 +297,11 @@ class WebSearchAgent:
                 await asyncio.sleep(min(0.5 * (2**attempt), 8.0))
         raise RuntimeError("Bilibili search retry loop ended unexpectedly") from last_error
 
-    async def _leetcode_contest_search(self, query: str) -> dict[str, Any]:
-        contest_number = self._contest_number_from_query(query)
-        target_date = self._date_from_query(query)
+    async def _leetcode_contest_search(
+        self,
+        contest_number: int | None,
+        target_date: date | None,
+    ) -> dict[str, Any]:
         if contest_number is None:
             upcoming = await self._leetcode_graphql(
                 "query upcomingContests { upcomingContests { title titleSlug startTime duration } }",
@@ -276,6 +325,9 @@ class WebSearchAgent:
             """,
             {"contestSlug": contest_slug},
         )
+        official_base_url = str(
+            question_payload.get("_official_base_url") or "https://leetcode.cn"
+        ).rstrip("/")
         questions = (question_payload.get("data") or {}).get("contestQuestionList") or []
         enriched_questions: list[dict[str, Any]] = []
         for item in questions:
@@ -290,6 +342,7 @@ class WebSearchAgent:
                         query questionData($titleSlug: String!) {
                           question(titleSlug: $titleSlug) {
                             questionId
+                            questionFrontendId
                             title
                             titleSlug
                             translatedTitle
@@ -312,6 +365,7 @@ class WebSearchAgent:
             "contest_number": contest_number,
             "contest_slug": contest_slug,
             "target_date": target_date.isoformat() if target_date else None,
+            "official_base_url": official_base_url,
             "questions": enriched_questions,
         }
 
@@ -320,60 +374,47 @@ class WebSearchAgent:
         query: str,
         variables: dict[str, Any],
     ) -> dict[str, Any]:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/127 Safari/537.36"
-            ),
-            "Referer": "https://leetcode.com/contest/",
-            "Origin": "https://leetcode.com",
-        }
         last_error: Exception | None = None
-        for attempt in range(5):
-            try:
-                async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
-                    response = await client.post(
-                        "https://leetcode.com/graphql",
-                        json={"query": query, "variables": variables},
+        for official_base_url in ("https://leetcode.cn", "https://leetcode.com"):
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/127 Safari/537.36"
+                ),
+                "Referer": f"{official_base_url}/contest/",
+                "Origin": official_base_url,
+            }
+            for attempt in range(5):
+                try:
+                    async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
+                        response = await client.post(
+                            f"{official_base_url}/graphql/",
+                            json={"query": query, "variables": variables},
+                        )
+                    response.raise_for_status()
+                    body = response.json()
+                    if not isinstance(body, dict):
+                        raise ValueError("LeetCode GraphQL response must be an object")
+                    if body.get("errors"):
+                        raise WebSearchError(str(body["errors"])[:500])
+                    body["_official_base_url"] = official_base_url
+                    return body
+                except WebSearchError as error:
+                    last_error = error
+                    break
+                except (httpx.TransportError, httpx.TimeoutException, httpx.HTTPStatusError) as error:
+                    last_error = error
+                    retryable = not isinstance(error, httpx.HTTPStatusError) or (
+                        error.response.status_code == 429
+                        or error.response.status_code >= 500
                     )
-                response.raise_for_status()
-                body = response.json()
-                if not isinstance(body, dict):
-                    raise ValueError("LeetCode GraphQL response must be an object")
-                if body.get("errors"):
-                    raise WebSearchError(str(body["errors"])[:500])
-                return body
-            except WebSearchError:
-                raise
-            except (httpx.TransportError, httpx.TimeoutException, httpx.HTTPStatusError) as error:
-                last_error = error
-                retryable = not isinstance(error, httpx.HTTPStatusError) or (
-                    error.response.status_code == 429
-                    or error.response.status_code >= 500
-                )
-                if attempt >= 4 or not retryable:
-                    raise
-                await asyncio.sleep(min(0.5 * (2**attempt), 8.0))
-        raise RuntimeError("LeetCode GraphQL retry loop ended unexpectedly") from last_error
-
-    @staticmethod
-    def _contest_number_from_query(query: str) -> int | None:
-        match = re.search(
-            r"(?:周赛|weekly\s+contest)\s*#?\s*(\d{2,3})(?![-\d])",
-            query,
-            re.IGNORECASE,
-        )
-        return int(match.group(1)) if match else None
-
-    @staticmethod
-    def _date_from_query(query: str) -> date | None:
-        match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", query)
-        if not match:
-            return None
-        try:
-            return date.fromisoformat(match.group(1))
-        except ValueError:
-            return None
+                    if attempt >= 4 or not retryable:
+                        break
+                    await asyncio.sleep(min(0.5 * (2**attempt), 8.0))
+                except (ValueError, json.JSONDecodeError) as error:
+                    last_error = error
+                    break
+        raise WebSearchError("LeetCode official GraphQL endpoints are unavailable") from last_error
 
     @staticmethod
     def _infer_weekly_contest_number(
@@ -406,49 +447,6 @@ class WebSearchAgent:
         weeks_back = max(0, round(days_until_upcoming / 7))
         return upcoming_number - weeks_back
 
-    def _make_date_aware(self, query: str) -> str:
-        lowered = query.casefold()
-        daily_terms = ("每日一题", "今天", "今日", "daily challenge", "today")
-        contest_terms = (
-            "周赛",
-            "weekly contest",
-            "weekly-contest",
-            "双周赛",
-            "biweekly contest",
-            "biweekly-contest",
-        )
-        relative_contest_terms = (
-            "周末",
-            "这周",
-            "本周",
-            "上周",
-            "最新",
-            "最近",
-            "weekend",
-            "this week",
-            "last week",
-            "latest",
-        )
-        is_daily = any(term in lowered for term in daily_terms)
-        is_relative_contest = (
-            any(term in lowered for term in contest_terms)
-            and any(term in lowered for term in relative_contest_terms)
-        )
-        if "leetcode" not in lowered or not (is_daily or is_relative_contest):
-            return query
-        today = self.current_time_tool.current_date()
-        iso_date = today.isoformat()
-        if iso_date in query:
-            return query
-        english_date = f"{calendar.month_name[today.month]} {today.day} {today.year}"
-        chinese_date = f"{today.year}年{today.month}月{today.day}日"
-        if is_relative_contest:
-            return f"{query} {iso_date} {chinese_date}"
-        return (
-            f"{query} LeetCode Daily Challenge {iso_date} {english_date} "
-            f"{chinese_date} solution"
-        )
-
     async def _serpapi_search(
         self,
         query: str,
@@ -458,7 +456,7 @@ class WebSearchAgent:
         params = {
             "engine": "google",
             "q": query,
-            "api_key": self.settings.serpapi_api_key.get_secret_value(),
+            "api_key": self.model_client.current_serpapi_api_key,
             "num": self.settings.web_search_max_results,
             "hl": "zh-cn",
         }
@@ -621,8 +619,6 @@ class WebSearchAgent:
         for item in raw_results:
             if not isinstance(item, dict):
                 continue
-            if item.get("mid") != 206214 and item.get("author") != "灵茶山艾府":
-                continue
             title = html.unescape(re.sub(r"<[^>]+>", "", str(item.get("title") or ""))).strip()
             description = html.unescape(
                 re.sub(r"<[^>]+>", "", str(item.get("description") or ""))
@@ -641,7 +637,18 @@ class WebSearchAgent:
                 rank=len(results) + 1,
                 title=title,
                 url=f"https://www.bilibili.com/video/{bvid}",
-                snippet=description or title,
+                snippet="；".join(
+                    part
+                    for part in (
+                        (
+                            f"作者={str(item.get('author') or '').strip()}"
+                            if item.get("author")
+                            else ""
+                        ),
+                        description or title,
+                    )
+                    if part
+                ),
                 source_type="bilibili_video",
                 source_position=len(results) + 1,
                 displayed_link="bilibili.com",
@@ -654,6 +661,10 @@ class WebSearchAgent:
         contest_number = payload.get("contest_number")
         contest_slug = str(payload.get("contest_slug") or "")
         target_date = payload.get("target_date")
+        official_base_url = str(
+            payload.get("official_base_url") or "https://leetcode.cn"
+        ).rstrip("/")
+        displayed_link = urlsplit(official_base_url).hostname or "leetcode.cn"
         questions = payload.get("questions")
         if not contest_number or not contest_slug or not isinstance(questions, list):
             return []
@@ -669,7 +680,12 @@ class WebSearchAgent:
                 or ""
             ).strip()
             title_slug = str(detail.get("titleSlug") or item.get("titleSlug") or "").strip()
-            question_id = str(detail.get("questionId") or item.get("questionId") or "").strip()
+            question_id = str(
+                detail.get("questionFrontendId")
+                or detail.get("questionId")
+                or item.get("questionId")
+                or ""
+            ).strip()
             if not title or not title_slug:
                 continue
             difficulty = str(detail.get("difficulty") or "unknown")
@@ -688,17 +704,17 @@ class WebSearchAgent:
             results.append(WebSearchResult(
                 rank=len(results) + 1,
                 title=f"LeetCode {question_id}: {title}" if question_id else title,
-                url=f"https://leetcode.com/problems/{title_slug}/",
+                url=f"{official_base_url}/problems/{title_slug}/",
                 snippet=(
                     f"LeetCode Weekly Contest {contest_number} official problem; "
-                    f"questionId={question_id}; credit={item.get('credit')}; "
+                    f"questionFrontendId={question_id}; credit={item.get('credit')}; "
                     f"difficulty={difficulty}; tags={', '.join(tag_names) or 'unknown'}; "
-                    f"contest=https://leetcode.com/contest/{contest_slug}/; "
+                    f"contest={official_base_url}/contest/{contest_slug}/; "
                     f"statement={statement[:2_700]}"
                 ),
                 source_type="leetcode_official",
                 source_position=len(results) + 1,
-                displayed_link="leetcode.com",
+                displayed_link=displayed_link,
                 published_date=str(target_date) if target_date else None,
             ))
         return results

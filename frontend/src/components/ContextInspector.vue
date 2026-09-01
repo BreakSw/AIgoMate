@@ -73,6 +73,14 @@ function reflectionRounds(value: string) {
 function callLabel(value: string) {
   return value.replace(/\+reflection:\d+/, '')
 }
+
+function difficultyLabel(value: string) {
+  return ({ easy: '简单', medium: '中等', hard: '困难', unknown: '待估计' } as Record<string, string>)[value] || value
+}
+
+function reviewDate(value?: string | null) {
+  return value ? new Date(value).toLocaleDateString('zh-CN') : '待记录'
+}
 </script>
 
 <template>
@@ -139,6 +147,36 @@ function callLabel(value: string) {
           <span><small>响应方式</small>{{ snapshot.agent_execution.task_spec.response_mode }}</span>
           <span><small>协助级别</small>{{ snapshot.agent_execution.task_spec.delivery.assistance_level }}</span>
           <span><small>能力路由</small>{{ snapshot.agent_execution.task_spec.routing.primary_capability }}</span>
+        </div>
+      </section>
+
+      <section v-if="snapshot.learning_profile?.active" class="learning-profile-card">
+        <header>
+          <span><small>ADAPTIVE LEARNING MODEL</small><strong>个性化学习画像</strong></span>
+          <b>{{ snapshot.learning_profile.updated ? '本轮已更新' : '本轮已读取' }}</b>
+        </header>
+        <p>{{ snapshot.learning_profile.summary }}</p>
+        <div class="learning-algorithms">
+          <span v-for="item in snapshot.learning_profile.algorithms" :key="item">{{ item }}</span>
+        </div>
+        <div class="learning-summary">
+          <span><small>IRT-1PL 能力值</small><strong>θ = {{ snapshot.learning_profile.ability_theta.toFixed(2) }}</strong></span>
+          <span><small>建议题目难度</small><strong>{{ difficultyLabel(snapshot.learning_profile.target_difficulty) }}</strong></span>
+          <span><small>优先知识点</small><strong>{{ snapshot.learning_profile.recommended_concepts.join('、') || '等待更多记录' }}</strong></span>
+        </div>
+        <div v-if="snapshot.learning_profile.concepts.length" class="learning-concepts">
+          <div v-for="item in snapshot.learning_profile.concepts" :key="item.concept" class="learning-concept-row">
+            <span><strong>{{ item.concept }}</strong><small>独立成功 {{ item.correct_attempts }} · 学习事件 {{ item.attempts }}</small></span>
+            <span class="mastery-value">BKT {{ Math.round(item.mastery_probability * 100) }}%</span>
+            <i><b :style="{ width: `${Math.round(item.mastery_probability * 100)}%` }"></b></i>
+            <small>FSRS-style：{{ reviewDate(item.next_review_at) }} 复习</small>
+          </div>
+        </div>
+        <div v-if="snapshot.learning_profile.updates.length" class="learning-updates">
+          <strong>本轮模型更新轨迹</strong>
+          <span v-for="item in snapshot.learning_profile.updates" :key="`${item.concept}:${item.outcome}`">
+            {{ item.concept }} · BKT {{ Math.round(item.mastery_before * 100) }}% → {{ Math.round(item.mastery_after * 100) }}% · IRT θ {{ item.ability_before.toFixed(2) }} → {{ item.ability_after.toFixed(2) }} · FSRS {{ item.fsrs_rating }}
+          </span>
         </div>
       </section>
 
@@ -311,7 +349,7 @@ function callLabel(value: string) {
 .rewrite-meta span { padding: 3px 6px; border-radius: 99px; color: #526c92; background: #edf2f8; font-size: 8px; }
 .rewrite-meta span.ambiguity { color: #8a6539; background: #f7eedf; }
 .rewrite-provider { display: block; margin-top: 8px; color: #a1a5ad; font-size: 8px; }
-.intent-card, .orchestration-card, .evidence-card, .polish-card { padding: 12px; border: 1px solid #dce1e8; border-radius: 10px; background: #fff; }
+.intent-card, .learning-profile-card, .orchestration-card, .evidence-card, .polish-card { padding: 12px; border: 1px solid #dce1e8; border-radius: 10px; background: #fff; }
 .intent-card header, .orchestration-card header, .evidence-card header, .polish-card header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .intent-card header > span, .orchestration-card header > span, .evidence-card header > span, .polish-card header > span { display: grid; gap: 2px; }
 .intent-card header small, .orchestration-card header small, .evidence-card header small, .polish-card header small { color: #6b89b4; font-size: 8px; letter-spacing: .12em; }
@@ -322,6 +360,29 @@ function callLabel(value: string) {
 .intent-summary-grid { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 6px; margin-top: 10px; }
 .intent-summary-grid span { color: #4b586b; font-size: 9px; line-height: 1.45; }
 .intent-summary-grid small { display: block; margin-bottom: 2px; color: #9b8460; font-size: 8px; }
+.learning-profile-card { border-left: 3px solid #5e8c79; background: linear-gradient(110deg, #f2f8f6, #fffaf1); }
+.learning-profile-card header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.learning-profile-card header > span { display: grid; gap: 2px; }
+.learning-profile-card header small { color: #4d806d; font-size: 8px; letter-spacing: .12em; }
+.learning-profile-card header strong { color: #34445c; font-size: 11px; }
+.learning-profile-card header b { padding: 4px 7px; border-radius: 99px; color: #76592f; background: #f5ead7; font-size: 8px; }
+.learning-profile-card > p { margin: 8px 0 0; color: #4b586b; font-size: 10px; line-height: 1.6; }
+.learning-algorithms { display: flex; gap: 5px; margin-top: 9px; }
+.learning-algorithms span { padding: 3px 7px; border: 1px solid #c8ded5; border-radius: 99px; color: #477463; background: #edf6f2; font-size: 8px; }
+.learning-summary { display: grid; grid-template-columns: .8fr .8fr 1.6fr; gap: 7px; margin-top: 10px; }
+.learning-summary span { padding: 8px; border-radius: 8px; background: rgba(255, 255, 255, .8); }
+.learning-summary small { display: block; margin-bottom: 3px; color: #9b8460; font-size: 8px; }
+.learning-summary strong { color: #405169; font-size: 10px; }
+.learning-concepts { display: grid; gap: 7px; margin-top: 10px; }
+.learning-concept-row { display: grid; grid-template-columns: 1fr auto; gap: 5px 8px; padding: 8px; border-radius: 8px; background: #fff; }
+.learning-concept-row > span:first-child { display: grid; gap: 2px; color: #405169; font-size: 9px; }
+.learning-concept-row small { color: #8d959f; font-size: 8px; }
+.mastery-value { color: #477463; font-size: 9px; font-weight: 700; }
+.learning-concept-row i { height: 4px; overflow: hidden; border-radius: 99px; background: #e4ebe8; }
+.learning-concept-row i b { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #4775aa, #63a185, #d0a158); }
+.learning-updates { display: grid; gap: 5px; margin-top: 10px; padding-top: 9px; border-top: 1px solid #dfe9e4; }
+.learning-updates strong { color: #526556; font-size: 9px; }
+.learning-updates span { color: #647084; font-size: 8px; line-height: 1.5; }
 .orchestration-card { border-left: 3px solid #d09b55; background: linear-gradient(105deg, #fffdf8, #fff); }
 .orchestration-meta, .polish-meta { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
 .orchestration-meta span, .polish-meta span { padding: 3px 6px; border-radius: 99px; color: #6a5d49; background: #f4eddf; font-size: 8px; }
@@ -374,5 +435,5 @@ function callLabel(value: string) {
 .compression-meta span, .topic-list span { padding: 3px 6px; border-radius: 99px; color: #526c92; background: #edf2f8; font-size: 8px; }
 .topic-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
 .compression-provider { display: block; margin-top: 10px; color: #a1a5ad; font-size: 8px; }
-@media (max-width: 760px) { .context-grid { grid-template-columns: 1fr; } .window-stats { grid-template-columns: 1fr 1fr; } .window-remaining { display: none; } .intent-summary-grid { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 760px) { .context-grid { grid-template-columns: 1fr; } .window-stats { grid-template-columns: 1fr 1fr; } .window-remaining { display: none; } .intent-summary-grid, .learning-summary { grid-template-columns: 1fr 1fr; } }
 </style>

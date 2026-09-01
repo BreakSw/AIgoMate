@@ -22,6 +22,27 @@ export interface Conversation {
   messages: ChatMessage[]
 }
 
+export interface ModelConfigStatus {
+  configured: boolean
+  model?: string | null
+  baseUrl?: string | null
+  maskedApiKey?: string | null
+  searchConfigured?: boolean
+  maskedSerpapiApiKey?: string | null
+  ttlSeconds?: number | null
+  expiresAt?: string | null
+}
+
+export interface ModelConfigInput {
+  apiKey?: string
+  serpapiApiKey?: string | null
+  model?: string
+  baseUrl?: string
+  ttlSeconds: number
+  updateModel?: boolean
+  updateSearch?: boolean
+}
+
 export interface IntentEntity {
   type: string
   value: string
@@ -166,6 +187,60 @@ export interface TurnContext {
   intent_provider: string
 }
 
+export type LearningOutcome = 'correct' | 'incorrect' | 'hinted' | 'solution_viewed' | 'reviewed'
+export type LearningDifficulty = 'easy' | 'medium' | 'hard' | 'unknown'
+
+export interface LearningObservation {
+  concept: string
+  outcome: LearningOutcome
+  difficulty: LearningDifficulty
+  confidence: number
+  evidence: string
+}
+
+export interface LearningUpdateTrace {
+  concept: string
+  outcome: LearningOutcome
+  mastery_before: number
+  mastery_after: number
+  ability_before: number
+  ability_after: number
+  predicted_success: number
+  fsrs_rating: 'Again' | 'Hard' | 'Good' | 'Easy'
+  next_review_at: string
+}
+
+export interface LearningConceptState {
+  concept: string
+  mastery_probability: number
+  attempts: number
+  correct_attempts: number
+  hint_count: number
+  fsrs_difficulty: number
+  fsrs_stability_days: number
+  last_review_at?: string | null
+  next_review_at?: string | null
+  last_outcome?: LearningOutcome | null
+  priority_score: number
+}
+
+export interface LearningProfileSnapshot {
+  schema_version: '1.0'
+  active: boolean
+  updated: boolean
+  scope: 'user_learning_profile'
+  user_id: number
+  session_id: number
+  ability_theta: number
+  target_difficulty: LearningDifficulty
+  summary: string
+  observations: LearningObservation[]
+  updates: LearningUpdateTrace[]
+  concepts: LearningConceptState[]
+  recommended_concepts: string[]
+  algorithms: string[]
+}
+
 export interface ContextSnapshot {
   schema_version: '1.0'
   memory: MemorySnapshot
@@ -175,6 +250,7 @@ export interface ContextSnapshot {
   input_organization?: InputOrganizationResult | null
   input_rewrite?: InputRewriteResult | null
   agent_execution?: AgentExecutionTrace | null
+  learning_profile?: LearningProfileSnapshot | null
   checkpoint_memory?: MemorySnapshot | null
 }
 

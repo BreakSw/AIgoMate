@@ -135,7 +135,11 @@ class ContextManager:
             response_mode=task_spec.response_mode,
             primary_capability=task_spec.routing.primary_capability,
             success_criteria=task_spec.success_criteria,
-            intent_model=self.settings.model,
+            intent_model=getattr(
+                getattr(self.compressor, "model_client", None),
+                "current_model",
+                self.settings.model,
+            ),
             intent_provider=intent_provider,
         )
         committed_turn = [

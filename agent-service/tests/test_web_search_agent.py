@@ -6,11 +6,11 @@
 """
 
 import asyncio
+from datetime import date
 from typing import Any
 
 import httpx
 import pytest
-from pydantic import SecretStr
 
 import app.core.web_search_agent as wsa_module
 from app.config import Settings
@@ -19,14 +19,18 @@ from app.core.web_search_agent import WebSearchAgent, WebSearchPlan
 
 
 def make_agent(**settings_overrides: Any) -> WebSearchAgent:
-    # Settings uses a validation alias for this field. Supplying the alias keeps
-    # the unit test isolated from any real SERPAPI_API_KEY in the local .env.
     serpapi_key = settings_overrides.pop(
         "serpapi_api_key",
-        SecretStr("test-key"),
+        "test-key",
     )
-    overrides = {"serpapi-key": serpapi_key, **settings_overrides}
-    return WebSearchAgent(model_client=None, settings=Settings(**overrides))
+
+    class RuntimeModelClient:
+        current_serpapi_api_key = serpapi_key
+
+    return WebSearchAgent(
+        model_client=RuntimeModelClient(),
+        settings=Settings(_env_file=None, **settings_overrides),
+    )
 
 
 def serpapi_payload() -> dict[str, Any]:
@@ -82,9 +86,9 @@ def install_fake_planner(monkeypatch, plan: WebSearchPlan) -> None:
 # 1. 可用性判断
 # ---------------------------------------------------------------------------
 
-def test_available_rejects_blank_key() -> None:
-    agent = make_agent(serpapi_api_key=SecretStr("   "))
-    assert agent.available() is False
+def test_blank_serpapi_key_does_not_disable_public_search_tools() -> None:
+    agent = make_agent(serpapi_api_key="   ")
+    assert agent.available() is True
 
 
 def test_available_accepts_configured_key() -> None:
@@ -100,6 +104,100 @@ def test_available_respects_disabled_flag() -> None:
 # ---------------------------------------------------------------------------
 # 2. 端到端：规划 → SerpAPI 请求 → RagEvidence 格式
 # ---------------------------------------------------------------------------
+
+def test_model_selected_bilibili_provider_calls_only_bilibili(monkeypatch) -> None:
+    plan = WebSearchPlan(
+        query="灵茶山艾府 LeetCode 周赛 2026-08-30",
+        provider="bilibili",
+        target_date=date(2026, 8, 30),
+    )
+    install_fake_planner(monkeypatch, plan)
+    agent = make_agent(serpapi_api_key="")
+    calls = {"bilibili": 0, "leetcode": 0, "serpapi": 0}
+
+    async def bilibili(_query: str):
+        calls["bilibili"] += 1
+        return {"data": {"result": [{
+            "author": "灵茶山艾府",
+            "title": "力扣周赛 516",
+            "description": "本场题目解析",
+            "bvid": "BV1TEST",
+        }]}}
+
+    async def forbidden_leetcode(*_args):
+        calls["leetcode"] += 1
+        raise AssertionError("单次计划不得自动串联 LeetCode")
+
+    async def forbidden_serpapi(*_args, **_kwargs):
+        calls["serpapi"] += 1
+        raise AssertionError("B站计划不得调用 SerpAPI")
+
+    monkeypatch.setattr(agent, "_bilibili_search", bilibili)
+    monkeypatch.setattr(agent, "_leetcode_contest_search", forbidden_leetcode)
+    monkeypatch.setattr(agent, "_serpapi_search", forbidden_serpapi)
+
+    evidence, provider = asyncio.run(agent.search("定位上周周赛", "先定位场次"))
+
+    assert provider == "fake-planner+bilibili"
+    assert calls == {"bilibili": 1, "leetcode": 0, "serpapi": 0}
+    assert evidence[0].metadata["source_type"] == "bilibili_video"
+
+
+def test_model_selected_leetcode_provider_calls_only_graphql(monkeypatch) -> None:
+    plan = WebSearchPlan(
+        query="核验 LeetCode 中国站周赛 516 官方题单",
+        provider="leetcode_graphql",
+        contest_number=516,
+    )
+    install_fake_planner(monkeypatch, plan)
+    agent = make_agent(serpapi_api_key="")
+    calls = {"bilibili": 0, "leetcode": 0, "serpapi": 0}
+
+    async def leetcode(contest_number, target_date):
+        calls["leetcode"] += 1
+        assert contest_number == 516
+        assert target_date is None
+        return {
+            "contest_number": 516,
+            "contest_slug": "weekly-contest-516",
+            "target_date": None,
+            "questions": [{
+                "title": "Verified Problem",
+                "titleSlug": "verified-problem",
+                "questionId": "4401",
+                "detail": {
+                    "questionFrontendId": "4401",
+                    "translatedTitle": "已核验赛题",
+                    "titleSlug": "verified-problem",
+                },
+            }],
+        }
+
+    async def forbidden_bilibili(*_args):
+        calls["bilibili"] += 1
+        raise AssertionError("官方核验计划不得回退 B站")
+
+    async def forbidden_serpapi(*_args, **_kwargs):
+        calls["serpapi"] += 1
+        raise AssertionError("GraphQL 计划不得调用 SerpAPI")
+
+    monkeypatch.setattr(agent, "_leetcode_contest_search", leetcode)
+    monkeypatch.setattr(agent, "_bilibili_search", forbidden_bilibili)
+    monkeypatch.setattr(agent, "_serpapi_search", forbidden_serpapi)
+
+    evidence, provider = asyncio.run(agent.search("核验周赛 516", "官方核验"))
+
+    assert provider == "fake-planner+leetcode-cn-graphql"
+    assert calls == {"bilibili": 0, "leetcode": 1, "serpapi": 0}
+    assert evidence[0].source_url == "https://leetcode.cn/problems/verified-problem/"
+
+
+def test_leetcode_plan_requires_structured_locator() -> None:
+    with pytest.raises(ValueError, match="contest_number 或 target_date"):
+        WebSearchAgent._validate_plan(WebSearchPlan(
+            query="LeetCode 周赛",
+            provider="leetcode_graphql",
+        ))
 
 def test_search_formats_evidence_and_request_params(monkeypatch) -> None:
     plan = WebSearchPlan(

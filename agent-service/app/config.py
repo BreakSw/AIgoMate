@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # Kept as a compatibility setting. Context compaction is now budget-driven;
     # a true value no longer forces a model call on every request.
     context_compress_every_request: bool = False
+    learning_profile_dir: str = "data/learning-profiles"
     rag_excerpt_chars: int = Field(default=3_500, ge=500, le=12_000)
     rag_total_context_chars: int = Field(default=12_000, ge=2_000, le=40_000)
     embedding_base_url: str = Field(
@@ -77,21 +78,42 @@ class Settings(BaseSettings):
     durable_memory_recall_limit: int = Field(default=12, ge=3, le=30)
     web_search_enabled: bool = True
     web_search_max_results: int = Field(default=5, ge=1, le=10)
-    serpapi_api_key: SecretStr | None = Field(
+    redis_url: str = Field(
+        default="redis://127.0.0.1:6379/0",
+        validation_alias=AliasChoices("REDIS_URL", "redis-url"),
+    )
+    redis_password: SecretStr | None = Field(
         default=None,
-        validation_alias=AliasChoices("serpapi-key", "SERPAPI_API_KEY"),
+        validation_alias=AliasChoices("REDIS_PASSWORD", "redis-password"),
     )
-    deepseek_url: str = Field(
-        default="https://api.deepseek.com",
-        validation_alias=AliasChoices("url", "DEEPSEEK_BASE_URL"),
+    model_config_encryption_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "MODEL_CONFIG_ENCRYPTION_KEY",
+            "model-config-encryption-key",
+        ),
     )
+    model_config_max_ttl_seconds: int = Field(
+        default=2_592_000,
+        ge=300,
+        le=31_536_000,
+        validation_alias=AliasChoices(
+            "MODEL_CONFIG_MAX_TTL_SECONDS",
+            "model-config-max-ttl-seconds",
+        ),
+    )
+    model_base_url_allowed_hosts: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "MODEL_BASE_URL_ALLOWED_HOSTS",
+            "model-base-url-allowed-hosts",
+        ),
+    )
+    # This is only a metadata fallback before a request binds its Redis model.
+    # Chat completions never read an API key or base URL from Settings.
     model: str = Field(
         default="deepseek-v4-pro",
         validation_alias=AliasChoices("model", "AGENT_MODEL"),
-    )
-    deepseek_api_key: SecretStr | None = Field(
-        default=None,
-        validation_alias=AliasChoices("DEEPSEEK_API_KEY", "api_key", "api-key"),
     )
     llm_timeout_seconds: float = Field(
         default=60,
@@ -117,13 +139,6 @@ class Settings(BaseSettings):
             "llm-retry-base-delay-seconds",
         ),
     )
-    anthropic_base_url: str | None = None
-    anthropic_auth_token: SecretStr | None = None
-    anthropic_proxy_model: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_PROXY_MODEL"),
-    )
-
     model_config = SettingsConfigDict(
         env_file=(PROJECT_ROOT / ".env", PROJECT_ROOT / "agent-service" / ".env"),
         env_file_encoding="utf-8",

@@ -33,7 +33,24 @@ COMPRESSION_PROMPT = """你是算法学习平台的上下文压缩 Agent。你�
 2. 约束、成功标准、未解决问题不能因压缩丢失。
 3. 不复制代码全文，只记录语言、用途、错误和消息序号等引用。
 4. long_term_memory 只放稳定、可跨会话使用的信息；不确定就留空。
-5. summary 应简洁但足以让后续 Agent 接着工作。"""
+5. summary 应简洁但足以让后续 Agent 接着工作。
+6. 以最新用户纠正为准。旧题号、日期、语言、方案和目标若已被用户否定或替换，应进入 resolved_items 并明确“已废弃”，
+   不能继续出现在 current_goal 或 pinned_constraints 中。
+7. 严格区分角色与事实来源：用户明确要求可以形成目标/约束；助手方案、搜索摘要和 RAG 内容只能记录为“已提出/待核验”，
+   未经用户确认不得升级为用户偏好或确定事实。
+8. 保留所有会改变后续执行的精确信息：数值约束、日期、版本、题号、代码语言、端口、文件名、错误文本摘要、完成标准、
+   禁止事项和用户已授权/未授权的操作。不要用“等”“类似”替代关键枚举。
+9. 对多阶段任务记录当前阶段、已完成步骤、失败尝试及失败原因、最近有效产物和明确下一步；不得只写最终主题而丢失
+   执行状态，也不得把计划中的步骤写成已经完成。
+10. open_questions 只保留确实未解决且仍相关的问题；已回答、已取消、可由工具公开查询或已被后续消息覆盖的项移入
+    resolved_items。不要让过期追问在压缩后复活。
+11. 工具/RAG/网页结果为空、不可用或证据冲突时，保留“尚未核验”的边界和已尝试方向，避免后续 Agent 重复相同调用；
+    但不要复制长证据正文，只记录证据编号、来源、关键结论和冲突点。
+12. artifact_references 使用消息序号和工件类型定位代码、图片、文件、报错与测试；多个相似工件要说明哪一个是最新版本。
+    不得生成不存在的路径、链接或行号。
+13. API Key、Token、密码、Cookie 和连接串不得进入任何字段；只可记录“相关凭据已配置/未配置”这类不含值的状态。
+14. 同一事实只保留一次，优先使用自包含短句；但去重不能合并掉不同作用域、不同版本或互相冲突的状态。
+15. 即使为了节省 token，也不能删除用户明确要求的输出格式、协助级别、语言、是否修改/测试/启动等执行边界。"""
 
 
 class CompressionPayloadResult(BaseModel):
@@ -106,7 +123,7 @@ class ContextCompressionAgent:
             decisions=result.decisions,
             artifact_references=result.artifact_references,
             source_message_count=source_message_count or len(history),
-            compression_model=self.model,
+            compression_model=getattr(self.model_client, "current_model", self.model),
             compression_provider=provider,
         )
         return memory, compressed

@@ -1,13 +1,15 @@
 from fastapi.testclient import TestClient
 
-from app.main import app, orchestrator
+from app.main import app, model_config_store, orchestrator
 from app.core.intent_recognizer import IntentRecognizer
+from app.core.model_config_store import ModelConfigStatus, RuntimeModelConfig
 from app.models import (
     AgentWorkResult,
     CoordinatorPlan,
     DeliverySpec,
     InputOrganizationResult,
     InputRewriteResult,
+    LearningProfileSnapshot,
     MemoryUpdateBatch,
     OutputFormatResult,
     PolishResult,
@@ -20,6 +22,13 @@ client = TestClient(app)
 
 
 def stub_downstream_agents(monkeypatch) -> None:
+    async def fake_model_config():
+        return RuntimeModelConfig(
+            api_key="test-key",
+            model="test-runtime-model",
+            base_url="https://model.example.test",
+        )
+
     async def fake_organize(message, on_retry=None):
         return InputOrganizationResult(
             organized_input=message,
@@ -40,6 +49,17 @@ def stub_downstream_agents(monkeypatch) -> None:
 
     async def fake_recall(user_id, session_id, query, limit=12):
         return []
+
+    async def fake_reset_session(user_id, session_id):
+        return None
+
+    async def fake_learning_profile(user_id, session_id, message, task_spec):
+        return LearningProfileSnapshot(
+            active=False,
+            user_id=user_id,
+            session_id=session_id,
+            summary="本轮未触发学习画像。",
+        )
 
     async def fake_run(**kwargs):
         task_spec = kwargs["task_spec"]
@@ -72,15 +92,85 @@ def stub_downstream_agents(monkeypatch) -> None:
     monkeypatch.setattr(orchestrator.memory_repository, "load", fake_load)
     monkeypatch.setattr(orchestrator.memory_repository, "upsert", fake_upsert)
     monkeypatch.setattr(orchestrator.memory_repository, "recall", fake_recall)
+    monkeypatch.setattr(
+        orchestrator.memory_repository,
+        "reset_session",
+        fake_reset_session,
+    )
     monkeypatch.setattr(orchestrator.adaptive_runtime, "run", fake_run)
+    monkeypatch.setattr(
+        orchestrator.learning_profile_service,
+        "process_turn",
+        fake_learning_profile,
+    )
     monkeypatch.setattr(orchestrator.polish_agent, "polish", fake_polish)
     monkeypatch.setattr(orchestrator.output_format_agent, "format", fake_format)
+    monkeypatch.setattr(model_config_store, "get", fake_model_config)
 
 
 def test_health() -> None:
     response = client.get("/health")
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "ok"
+
+
+def test_clear_session_memory_endpoint(monkeypatch) -> None:
+    calls = []
+
+    async def fake_reset_session(user_id, session_id):
+        calls.append((user_id, session_id))
+
+    monkeypatch.setattr(
+        orchestrator.memory_repository,
+        "reset_session",
+        fake_reset_session,
+    )
+
+    response = client.delete("/api/agent/users/3/sessions/19/memory")
+
+    assert response.status_code == 204
+    assert calls == [(3, 19)]
+
+
+def test_model_config_status_only_returns_masked_key(monkeypatch) -> None:
+    async def fake_status():
+        return ModelConfigStatus(
+            configured=True,
+            model="test-model",
+            baseUrl="https://model.example.test",
+            maskedApiKey="tes••••••-key",
+            searchConfigured=True,
+            maskedSerpapiApiKey="ser••••••-key",
+            ttlSeconds=3_600,
+            expiresAt="2026-08-31T12:00:00+00:00",
+        )
+
+    monkeypatch.setattr(model_config_store, "status", fake_status)
+    response = client.get("/api/model-config")
+
+    assert response.status_code == 200
+    assert response.json()["maskedApiKey"] == "tes••••••-key"
+    assert response.json()["maskedSerpapiApiKey"] == "ser••••••-key"
+    assert "apiKey" not in response.json()
+    assert "serpapiApiKey" not in response.json()
+
+
+def test_agent_rejects_expired_model_config_without_env_fallback(monkeypatch) -> None:
+    async def missing_config():
+        return None
+
+    monkeypatch.setattr(model_config_store, "get", missing_config)
+    response = client.post(
+        "/api/agent/respond",
+        json={
+            "sessionId": 98,
+            "message": "解释二分查找",
+            "history": [],
+        },
+    )
+
+    assert response.status_code == 503
+    assert "模型配置不存在或已经过期" in response.json()["detail"]
 
 
 def test_agent_response(monkeypatch) -> None:
@@ -114,7 +204,11 @@ def test_agent_response(monkeypatch) -> None:
     monkeypatch.setattr(orchestrator.intent_recognizer, "recognize", fake_recognize)
     response = client.post(
         "/api/agent/respond",
-        json={"sessionId": 1, "message": "帮我分析二分查找复杂度", "history": []},
+        json={
+            "sessionId": 1,
+            "message": "帮我分析二分查找复杂度",
+            "history": [],
+        },
     )
     assert response.status_code == 200, response.text
     assert response.json()["intent"] == "complexity_analysis"
@@ -131,6 +225,71 @@ def test_agent_response(monkeypatch) -> None:
         "polish:test-polish",
         "format:test-format",
     ]
+
+
+def test_learning_profile_is_visible_in_response_and_context(monkeypatch) -> None:
+    stub_downstream_agents(monkeypatch)
+
+    async def fake_rewrite(message, history, on_retry=None):
+        return InputRewriteResult(
+            input_type="text",
+            formatted_input=message,
+            explicit_request="记录学习结果",
+            requested_operations=["plan_learning"],
+            request_is_actionable=True,
+            contains_code=False,
+            rewrite_summary="保留明确学习反馈",
+            rewrite_model="test-model",
+            rewrite_provider="test-provider",
+        )
+
+    async def fake_recognize(message, history, on_retry=None, code_artifact=None, input_rewrite=None):
+        return TaskSpec(
+            primary_intent="review_planning",
+            normalized_request=message,
+            user_goal="记录二分查找学习结果",
+            recognition_summary="用户明确表示独立做对二分查找题",
+            response_mode="direct_answer",
+            delivery=DeliverySpec(assistance_level="explanation_only"),
+            routing=RoutingPlan(primary_capability="review_planning"),
+            confidence=0.98,
+        ), "test-provider"
+
+    async def fake_learning_profile(user_id, session_id, message, task_spec):
+        return LearningProfileSnapshot(
+            active=True,
+            updated=True,
+            user_id=user_id,
+            session_id=session_id,
+            ability_theta=0.2,
+            target_difficulty="medium",
+            summary="已更新 BKT、IRT 与 FSRS-style 学习状态。",
+            recommended_concepts=["二分查找"],
+        )
+
+    monkeypatch.setattr(orchestrator.input_rewriter, "rewrite", fake_rewrite)
+    monkeypatch.setattr(orchestrator.intent_recognizer, "recognize", fake_recognize)
+    monkeypatch.setattr(
+        orchestrator.learning_profile_service,
+        "process_turn",
+        fake_learning_profile,
+    )
+
+    response = client.post(
+        "/api/agent/respond",
+        json={
+            "sessionId": 101,
+            "message": "我独立做对了一道中等二分查找题。",
+            "history": [],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "### 个性化学习画像" in body["content"]
+    assert "IRT 能力值" in body["content"]
+    assert body["context_snapshot"]["learning_profile"]["active"] is True
+    assert "learning-profile:local-bkt-irt-fsrs" in body["context_snapshot"]["agent_execution"]["model_call_trace"]
 
 
 def test_recognizer_builds_agent_ready_task_spec() -> None:
@@ -235,7 +394,11 @@ def test_retry_progress_is_exposed_for_sse_gateway(monkeypatch) -> None:
     monkeypatch.setattr(orchestrator.intent_recognizer, "recognize", fake_recognize)
     response = client.post(
         "/api/agent/analyze-intent",
-        json={"sessionId": 77, "message": "解释二分查找", "history": []},
+        json={
+            "sessionId": 77,
+            "message": "解释二分查找",
+            "history": [],
+        },
     )
     retry_status = client.get("/api/agent/sessions/77/retry-status")
 

@@ -56,6 +56,7 @@ class AdaptiveAgentRuntime:
         snapshot: ContextSnapshot,
         conversation_context: list[ConversationMessage],
         durable_memory: list[DurableMemoryItem],
+        previous_turn_evidence: list[RagEvidence] | None = None,
         on_retry: RetryCallback | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> tuple[
@@ -67,8 +68,21 @@ class AdaptiveAgentRuntime:
         list[str],
     ]:
         decisions: list[HeadDecision] = []
+        evidence: list[RagEvidence] = [
+            item.model_copy(update={
+                "metadata": {
+                    **item.metadata,
+                    "carried_from_previous_turn": True,
+                }
+            })
+            for item in (previous_turn_evidence or [])
+        ]
         observations: list[str] = []
-        evidence: list[RagEvidence] = []
+        if evidence:
+            observations.append(
+                f"已载入上一轮 {len(evidence)} 条真实检索证据供续问复用；"
+                "旧 assistant 文本仍不是证据，新增交付要求需要检查现有证据是否足够。"
+            )
         rag_queries: list[RagQuery] = []
         web_queries: list[str] = []
         known_limits: list[str] = []
@@ -98,6 +112,7 @@ class AdaptiveAgentRuntime:
                 session_id,
                 snapshot.memory,
                 durable_memory,
+                snapshot.learning_profile,
             )
             runtime_state = self._runtime_state(
                 decisions,
@@ -114,14 +129,18 @@ class AdaptiveAgentRuntime:
                 "remaining_after_this_decision": self.max_iterations - iteration,
             }
             decision, provider = await self.coordinator.decide(
-                task_spec,
-                snapshot,
-                runtime_state,
-                self.rag_retriever.availability(),
-                self.web_search_agent.available(),
-                dynamic_prompt,
-                iteration,
-                on_retry,
+                task_spec=task_spec,
+                snapshot=snapshot,
+                runtime_state=runtime_state,
+                knowledge_availability=self.rag_retriever.availability(),
+                web_search_available=self.web_search_agent.available(),
+                dynamic_system_prompt=dynamic_prompt,
+                iteration=iteration,
+                conversation_context=self._conversation_context_for_task(
+                    task_spec,
+                    conversation_context,
+                ),
+                on_retry=on_retry,
             )
             decisions.append(decision)
             providers.append(f"head#{iteration}:{provider}")
@@ -182,11 +201,19 @@ class AdaptiveAgentRuntime:
                     rag_status = "error"
                     continue
                 added = self._merge_evidence(evidence, found, prefix="R")
-                rag_status = "candidate_found" if added else "miss"
+                existing_rag_count = sum(
+                    1 for item in evidence if item.collection != "web_search"
+                )
+                rag_status = "candidate_found" if existing_rag_count else "miss"
                 if added:
                     observations.append(
                         f"{query.collection} 检索完成，新增 {added} 条候选证据；"
                         "首脑仍需判断其是否真正覆盖用户题面，候选不等于有效命中。"
+                    )
+                elif found and existing_rag_count:
+                    observations.append(
+                        f"{query.collection} 检索结果与已有候选重复，没有新增证据；"
+                        f"继续保留现有 {existing_rag_count} 条候选供首脑判断。"
                     )
                 else:
                     observations.append(
@@ -202,19 +229,16 @@ class AdaptiveAgentRuntime:
                     "首脑智能体",
                     "后续由专业 Agent 基于用户题面协作解题，仍可按需联网",
                 )
-                ignored_rag_count = sum(
+                retained_rag_count = sum(
                     1 for item in evidence if item.collection != "web_search"
                 )
-                evidence[:] = [
-                    item for item in evidence if item.collection == "web_search"
-                ]
                 execution_mode = "native_reasoning"
-                if rag_status == "candidate_found":
+                if retained_rag_count:
                     rag_status = "insufficient"
                 observations.append(
-                    "已切换到自主推理模式：后续不依赖 RAG，"
-                    f"已隔离 {ignored_rag_count} 条未被首脑认可的候选；"
-                    "可以联网补充资料，联网失败时仍必须根据用户题面继续推理。"
+                    "已切换到自主推理模式：不再继续依赖 RAG 扩展结论，"
+                    f"但保留 {retained_rag_count} 条候选作为低信任参考；"
+                    "执行 Agent 必须逐条核对适用范围，不能把候选冒充已确认事实。"
                 )
                 providers.append(f"mode#{iteration}:native-reasoning")
                 continue
@@ -328,10 +352,9 @@ class AdaptiveAgentRuntime:
                 work_request = AgentWorkRequest(
                     task_spec=task_spec,
                     coordinator_plan=current_plan,
-                    conversation_context=(
-                        conversation_context
-                        if task_spec.context_plan.recent_messages
-                        else []
+                    conversation_context=self._conversation_context_for_task(
+                        task_spec,
+                        conversation_context,
                     ),
                     memory=snapshot.memory,
                     durable_memory=durable_memory,
@@ -366,9 +389,6 @@ class AdaptiveAgentRuntime:
             if evidence or user_material_available:
                 if user_material_available and rag_status != "hit":
                     execution_mode = "native_reasoning"
-                    evidence[:] = [
-                        item for item in evidence if item.collection == "web_search"
-                    ]
                     if rag_status == "candidate_found":
                         rag_status = "insufficient"
                     elif rag_status == "not_checked":
@@ -397,6 +417,7 @@ class AdaptiveAgentRuntime:
                     session_id,
                     snapshot.memory,
                     durable_memory,
+                    snapshot.learning_profile,
                 )
                 current_plan = self._build_plan(
                     task_spec,
@@ -412,10 +433,9 @@ class AdaptiveAgentRuntime:
                 work_request = AgentWorkRequest(
                     task_spec=task_spec,
                     coordinator_plan=current_plan,
-                    conversation_context=(
-                        conversation_context
-                        if task_spec.context_plan.recent_messages
-                        else []
+                    conversation_context=self._conversation_context_for_task(
+                        task_spec,
+                        conversation_context,
                     ),
                     memory=snapshot.memory,
                     durable_memory=durable_memory,
@@ -474,6 +494,7 @@ class AdaptiveAgentRuntime:
                 session_id,
                 snapshot.memory,
                 durable_memory,
+                snapshot.learning_profile,
             )
             solution_plan = self._build_plan(
                 task_spec,
@@ -489,10 +510,9 @@ class AdaptiveAgentRuntime:
             solution_request = AgentWorkRequest(
                 task_spec=task_spec,
                 coordinator_plan=solution_plan,
-                conversation_context=(
-                    conversation_context
-                    if task_spec.context_plan.recent_messages
-                    else []
+                conversation_context=self._conversation_context_for_task(
+                    task_spec,
+                    conversation_context,
                 ),
                 memory=snapshot.memory,
                 durable_memory=durable_memory,
@@ -516,13 +536,12 @@ class AdaptiveAgentRuntime:
             work_history.append(latest_work_result)
 
         if (
-            execution_mode == "native_reasoning"
-            and self._has_user_problem_material(task_spec)
+            self._requires_verification(task_spec)
             and latest_work_result.agent != "clarification_agent"
             and self._needs_verification(work_history)
         ):
             last_instruction = (
-                "决策轮次已结束，但自主推理解题必须完成独立验证。阅读 prior_work_results，"
+                "决策轮次已结束，但最新解题或代码产物必须完成独立验证。阅读 prior_work_results，"
                 "检查题意一致性、样例、边界条件、正确性、复杂度以及代码与算法是否一致；"
                 "修正发现的问题，并在 draft_answer 中返回可直接交付给用户的完整最终答案。"
             )
@@ -538,6 +557,7 @@ class AdaptiveAgentRuntime:
                 session_id,
                 snapshot.memory,
                 durable_memory,
+                snapshot.learning_profile,
             )
             verification_plan = self._build_plan(
                 task_spec,
@@ -553,10 +573,9 @@ class AdaptiveAgentRuntime:
             verification_request = AgentWorkRequest(
                 task_spec=task_spec,
                 coordinator_plan=verification_plan,
-                conversation_context=(
-                    conversation_context
-                    if task_spec.context_plan.recent_messages
-                    else []
+                conversation_context=self._conversation_context_for_task(
+                    task_spec,
+                    conversation_context,
                 ),
                 memory=snapshot.memory,
                 durable_memory=durable_memory,
@@ -639,7 +658,11 @@ class AdaptiveAgentRuntime:
             None,
         )
         if execution_mode == "native_reasoning":
-            grounding = "prefer_rag" if web_queries else "no_rag"
+            grounding = (
+                "prefer_rag"
+                if web_queries or rag_status in {"candidate_found", "insufficient", "hit"}
+                else "no_rag"
+            )
         else:
             grounding = (
                 "require_rag"
@@ -720,6 +743,7 @@ class AdaptiveAgentRuntime:
                             "verified_daily_challenge",
                             "problem_id",
                             "difficulty",
+                            "carried_from_previous_turn",
                         }
                     },
                 }
@@ -784,6 +808,27 @@ class AdaptiveAgentRuntime:
             default=-1,
         )
         return last_solution >= 0 and last_verification < last_solution
+
+    @staticmethod
+    def _requires_verification(task_spec: TaskSpec) -> bool:
+        return CoordinatorAgent._requires_verification(task_spec)
+
+    @staticmethod
+    def _conversation_context_for_task(
+        task_spec: TaskSpec,
+        conversation_context: list,
+    ) -> list:
+        """Only continuation tasks receive old assistant drafts.
+
+        A self-contained request already carries its complete meaning in TaskSpec.
+        Supplying prior assistant answers in that case lets an earlier hallucination
+        become an apparent fact source for a new task.
+        """
+        if not task_spec.context_plan.recent_messages:
+            return []
+        if not task_spec.context_plan.task_state:
+            return []
+        return conversation_context
 
     @staticmethod
     def _has_solution_work(work_history: list[AgentWorkResult]) -> bool:
@@ -901,11 +946,9 @@ class AdaptiveAgentRuntime:
             "mock_interview",
         }:
             return "problem_solving_agent"
-        if task_spec.primary_intent in {
-            "code_generation",
-            "code_diagnosis",
-            "complexity_analysis",
-        }:
+        if task_spec.primary_intent == "code_generation":
+            return "implementation_agent"
+        if task_spec.primary_intent in {"code_diagnosis", "complexity_analysis"}:
             return "code_analysis_agent"
         if task_spec.primary_intent in {"review_planning", "learning_consultation"}:
             return "learning_planning_agent"

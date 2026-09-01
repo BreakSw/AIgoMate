@@ -35,7 +35,9 @@ public class IntentStreamService {
         this.executor = executor;
     }
 
-    public SseEmitter stream(Long userId, Long sessionId, String content) {
+    public SseEmitter stream(Long userId,
+                             Long sessionId,
+                             String content) {
         SseEmitter emitter = new SseEmitter(STREAM_TIMEOUT_MS);
         StreamKey key = new StreamKey(userId, sessionId);
         ActiveStream active = new ActiveStream(emitter);
@@ -46,7 +48,8 @@ public class IntentStreamService {
         emitter.onCompletion(() -> cancel(key, active, false));
         emitter.onTimeout(() -> cancel(key, active, false));
         emitter.onError(ignored -> cancel(key, active, false));
-        executor.execute(() -> execute(key, active, userId, sessionId, content));
+        executor.execute(() -> execute(
+                key, active, userId, sessionId, content));
         return emitter;
     }
 
@@ -65,9 +68,9 @@ public class IntentStreamService {
 
     private void execute(StreamKey key,
                          ActiveStream active,
-                         Long userId,
-                         Long sessionId,
-                         String content) {
+                          Long userId,
+                          Long sessionId,
+                          String content) {
         SseEmitter emitter = active.emitter();
         try {
             if (!active.isCancelled()) {

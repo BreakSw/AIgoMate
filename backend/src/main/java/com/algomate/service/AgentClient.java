@@ -31,6 +31,8 @@ public class AgentClient {
     private final String retryStatusBaseUrl;
     private final String progressStatusBaseUrl;
     private final String ragOverviewBaseUrl;
+    private final URI modelConfigUri;
+    private final String sessionMemoryBaseUrl;
 
     public AgentClient(@Value("${agent.service.base-url}") String baseUrl, ObjectMapper objectMapper) {
         this.httpClient = HttpClient.newBuilder()
@@ -42,20 +44,30 @@ public class AgentClient {
         this.retryStatusBaseUrl = baseUrl + "/api/agent/sessions/";
         this.progressStatusBaseUrl = baseUrl + "/api/agent/sessions/";
         this.ragOverviewBaseUrl = baseUrl + "/api/rag/overview";
+        this.modelConfigUri = URI.create(baseUrl + "/api/model-config");
+        this.sessionMemoryBaseUrl = baseUrl + "/api/agent/users/";
     }
 
-    public String respond(Long userId, Long sessionId, String prompt, List<ChatMessage> history) {
+    public String respond(Long userId,
+                          Long sessionId,
+                          String prompt,
+                          List<ChatMessage> history) {
         try {
-            return analyzeIntent(userId, sessionId, prompt, history).content();
+            return analyzeIntent(
+                    userId, sessionId, prompt, history).content();
         } catch (AgentServiceException exception) {
             log.warn("Agent service is unavailable: {}", exception.getMessage());
             return "意图识别服务暂时不可用，但你的消息已经安全保存。请检查模型配置后重试。";
         }
     }
 
-    public AgentResponse analyzeIntent(Long userId, Long sessionId, String prompt, List<ChatMessage> history) {
+    public AgentResponse analyzeIntent(Long userId,
+                                       Long sessionId,
+                                       String prompt,
+                                       List<ChatMessage> history) {
         try {
-            return analyzeIntentAsync(userId, sessionId, prompt, history, null).join();
+            return analyzeIntentAsync(
+                    userId, sessionId, prompt, history, null).join();
         } catch (CompletionException exception) {
             Throwable cause = exception.getCause();
             if (cause instanceof AgentServiceException agentServiceException) {
@@ -77,7 +89,12 @@ public class AgentClient {
 
         try {
             String requestJson = objectMapper.writeValueAsString(
-                    new AgentRequest(userId, sessionId, prompt, context, previousContextSnapshot));
+                    new AgentRequest(
+                            userId,
+                            sessionId,
+                            prompt,
+                            context,
+                            previousContextSnapshot));
             HttpRequest request = HttpRequest.newBuilder(analyzeIntentUri)
                     .timeout(Duration.ofMinutes(7))
                     .header("Content-Type", "application/json")
@@ -182,6 +199,99 @@ public class AgentClient {
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             throw new AgentServiceException("RAG overview request was interrupted", exception);
+        }
+    }
+
+    public JsonNode getModelConfig() {
+        return sendModelConfigRequest(
+                HttpRequest.newBuilder(modelConfigUri)
+                        .timeout(Duration.ofSeconds(5))
+                        .GET()
+                        .build());
+    }
+
+    public JsonNode saveModelConfig(Object payload) {
+        try {
+            String requestJson = objectMapper.writeValueAsString(payload);
+            return sendModelConfigRequest(
+                    HttpRequest.newBuilder(modelConfigUri)
+                            .timeout(Duration.ofSeconds(5))
+                            .header("Content-Type", "application/json")
+                            .PUT(HttpRequest.BodyPublishers.ofString(
+                                    requestJson, StandardCharsets.UTF_8))
+                            .build());
+        } catch (JsonProcessingException exception) {
+            throw new AgentServiceException(
+                    "模型配置无法序列化", exception);
+        }
+    }
+
+    public void deleteModelConfig() {
+        deleteModelConfigAt(modelConfigUri);
+    }
+
+    public void deleteModelConfigSection(String section) {
+        deleteModelConfigAt(URI.create(modelConfigUri + "/" + section));
+    }
+
+    public void clearSessionMemory(Long userId, Long sessionId) {
+        URI uri = URI.create(
+                sessionMemoryBaseUrl + userId + "/sessions/" + sessionId + "/memory");
+        HttpRequest request = HttpRequest.newBuilder(uri)
+                .timeout(Duration.ofSeconds(5))
+                .DELETE()
+                .build();
+        try {
+            HttpResponse<String> response = httpClient.send(
+                    request,
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() != 204) {
+                throw new AgentServiceException(extractErrorDetail(response));
+            }
+        } catch (IOException exception) {
+            throw new AgentServiceException("会话记忆服务不可用", exception);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new AgentServiceException("会话记忆清理请求被中断", exception);
+        }
+    }
+
+    private void deleteModelConfigAt(URI uri) {
+        HttpRequest request = HttpRequest.newBuilder(uri)
+                .timeout(Duration.ofSeconds(5))
+                .DELETE()
+                .build();
+        try {
+            HttpResponse<String> response = httpClient.send(
+                    request,
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() != 204) {
+                throw new AgentServiceException(extractErrorDetail(response));
+            }
+        } catch (IOException exception) {
+            throw new AgentServiceException("Redis 模型配置服务不可用", exception);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new AgentServiceException("模型配置删除请求被中断", exception);
+        }
+    }
+
+    private JsonNode sendModelConfigRequest(HttpRequest request) {
+        try {
+            HttpResponse<String> response = httpClient.send(
+                    request,
+                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                throw new AgentServiceException(extractErrorDetail(response));
+            }
+            return objectMapper.readTree(response.body());
+        } catch (JsonProcessingException exception) {
+            throw new AgentServiceException("模型配置响应无法解析", exception);
+        } catch (IOException exception) {
+            throw new AgentServiceException("Redis 模型配置服务不可用", exception);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new AgentServiceException("模型配置请求被中断", exception);
         }
     }
 

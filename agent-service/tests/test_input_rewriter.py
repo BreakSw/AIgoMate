@@ -1,10 +1,7 @@
 import asyncio
 import json
 
-import pytest
-
 from app.core.input_rewriter import UserInputRewriteAgent
-from app.core.reflection import AgentProtocolExhaustedError
 from app.models import ConversationMessage
 
 
@@ -101,7 +98,7 @@ def test_invalid_null_field_is_reflected_and_rewritten() -> None:
     assert result.rewrite_provider == "test-deepseek+reflection:1"
 
 
-def test_reflection_stops_after_ten_revision_rounds() -> None:
+def test_reflection_exhaustion_falls_back_without_blocking_the_request() -> None:
     class AlwaysInvalidModelClient:
         def __init__(self) -> None:
             self.calls = 0
@@ -119,13 +116,17 @@ def test_reflection_stops_after_ten_revision_rounds() -> None:
         max_reflection_rounds=10,
     )
 
-    with pytest.raises(AgentProtocolExhaustedError) as captured:
-        asyncio.run(agent.rewrite(CPP_CODE + "\n帮我看看这段代码", []))
+    result = asyncio.run(agent.rewrite("请讲解今天的 LeetCode 每日一题", []))
 
     # One initial generation plus at most ten Reflection revisions.
     assert client.calls == 11
-    assert captured.value.reflection_rounds == 10
-    assert captured.value.agent_name == "输入改写 Agent"
+    assert result.formatted_input == "请讲解今天的 LeetCode 每日一题"
+    assert result.explicit_request == "请讲解今天的 LeetCode 每日一题"
+    assert result.requested_operations == ["general_request"]
+    assert result.request_is_actionable is True
+    assert result.rewrite_provider.endswith(
+        "+reflection-exhausted+deterministic-fallback"
+    )
 
 
 def test_single_line_code_is_preserved_as_an_artifact() -> None:

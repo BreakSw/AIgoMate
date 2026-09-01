@@ -85,3 +85,29 @@ def test_snapshot_scope_must_match_current_conversation() -> None:
     assert AgentOrchestrator._scoped_previous_snapshot(matching) is snapshot
     assert AgentOrchestrator._scoped_previous_snapshot(different_session) is None
     assert AgentOrchestrator._scoped_previous_snapshot(legacy) is None
+
+
+def test_first_turn_reset_prevents_reused_session_id_memory_leak(tmp_path) -> None:
+    import asyncio
+
+    from app.core.memory_store import UserMemoryRepository
+    from app.models import MemoryUpdate
+
+    async def scenario() -> None:
+        repository = UserMemoryRepository(tmp_path, "memory")
+        await repository.upsert(
+            1,
+            7,
+            [MemoryUpdate(
+                kind="long_term_goal",
+                content="旧数据库中的动态规划学习目标",
+                importance=0.9,
+                reason="模拟旧会话残留",
+            )],
+        )
+
+        await repository.reset_session(1, 7)
+
+        assert await repository.load(1, 7) == []
+
+    asyncio.run(scenario())

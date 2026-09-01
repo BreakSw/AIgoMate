@@ -10,6 +10,7 @@ from app.core.response_agent import ResponseAgent
 from app.models import (
     AgentWorkResult,
     AgentWorkRequest,
+    ConversationMessage,
     ContextSnapshot,
     ContextPlan,
     CoordinatorPlan,
@@ -17,6 +18,7 @@ from app.models import (
     HeadDecision,
     InputArtifacts,
     MemorySnapshot,
+    RagEvidence,
     RagQuery,
     RoutingPlan,
     TaskSpec,
@@ -434,3 +436,400 @@ def test_runtime_rag_miss_switches_to_head_controlled_multi_agent_reasoning() ->
     ]
     assert response_agent.requests[0].prior_work_results == []
     assert response_agent.requests[1].prior_work_results[0].agent == "strategy_agent"
+
+
+def test_duplicate_rag_query_is_rejected() -> None:
+    task = make_task_spec()
+    duplicate = HeadDecision(
+        iteration=2,
+        rationale="重复检索",
+        action="retrieve_rag",
+        rag_query=RagQuery(
+            collection="problem_bank",
+            query="  动态规划   困难  ",
+            reason="再次查找",
+        ),
+    )
+    state = {
+        "actions_taken": [{
+            "iteration": 1,
+            "action": "retrieve_rag",
+            "rag_query": {
+                "collection": "problem_bank",
+                "query": "动态规划 困难",
+            },
+        }],
+        "execution_mode": "rag_assisted",
+        "rag_status": "candidate_found",
+    }
+
+    with pytest.raises(ValueError, match="禁止重复相同 RAG 查询"):
+        CoordinatorAgent._validate(duplicate, state, task, True)
+
+
+def test_self_contained_task_does_not_receive_old_assistant_drafts() -> None:
+    context = [
+        {"role": "user", "content": "上一轮用户请求"},
+        {"role": "assistant", "content": "未经核验的旧题目"},
+    ]
+    self_contained = make_task_spec().model_copy(update={
+        "context_plan": ContextPlan(recent_messages=True, task_state=False),
+    })
+    continuation = make_task_spec().model_copy(update={
+        "context_plan": ContextPlan(recent_messages=True, task_state=True),
+    })
+
+    assert AdaptiveAgentRuntime._conversation_context_for_task(
+        self_contained,
+        context,
+    ) == []
+    assert AdaptiveAgentRuntime._conversation_context_for_task(
+        continuation,
+        context,
+    ) == context
+
+
+def test_head_protocol_exhaustion_falls_back_to_reverify_continuation() -> None:
+    class InvalidHeadModel:
+        async def complete_json(self, *_args, **_kwargs):
+            return "{}", "fake-head"
+
+    task = make_task_spec().model_copy(update={
+        "primary_intent": "code_generation",
+        "normalized_request": "为上一轮列出的每道题提供 C++ 代码",
+        "user_goal": "获得上一轮四道周赛题的 C++ 实现",
+        "delivery": DeliverySpec(
+            assistance_level="direct_solution",
+            include_code=True,
+        ),
+        "context_plan": ContextPlan(recent_messages=True, task_state=True),
+    })
+    context = [
+        ConversationMessage(role="assistant", content="上一轮列出了周赛题号与标题"),
+        ConversationMessage(role="user", content="我需要每道题的 C++ 代码"),
+    ]
+    coordinator = CoordinatorAgent(InvalidHeadModel(), max_reflection_rounds=1)
+
+    decision, provider = asyncio.run(coordinator.decide(
+        task_spec=task,
+        snapshot=ContextSnapshot.model_construct(memory=MemorySnapshot()),
+        runtime_state={
+            "actions_taken": [],
+            "execution_mode": "rag_assisted",
+            "rag_status": "not_checked",
+            "evidence": [],
+            "work_history": [],
+        },
+        knowledge_availability={},
+        web_search_available=True,
+        dynamic_system_prompt="",
+        iteration=1,
+        conversation_context=context,
+    ))
+
+    assert decision.action == "search_web"
+    assert "上一轮列出了周赛题号" in (decision.web_query or "")
+    assert provider.endswith("+protocol-fallback")
+
+
+def test_continuation_reuses_previous_tool_evidence_not_assistant_text() -> None:
+    continuation = make_task_spec().model_copy(update={
+        "primary_intent": "code_generation",
+        "context_plan": ContextPlan(recent_messages=True, task_state=True),
+    })
+    previous = RagEvidence(
+        evidence_id="W1",
+        collection="web_search",
+        title="LeetCode 官方题面",
+        content="官方题面、约束和函数签名",
+        source_url="https://leetcode.cn/problems/example/",
+        score=1.0,
+        metadata={"source_type": "leetcode_official"},
+    )
+
+    class FakeCoordinator:
+        def __init__(self) -> None:
+            self.decisions = [
+                HeadDecision(
+                    iteration=1,
+                    rationale="已有官方题面",
+                    action="delegate",
+                    selected_agent="implementation_agent",
+                    task_instruction="依据官方题面生成 C++",
+                ),
+                HeadDecision(
+                    iteration=2,
+                    rationale="实现完成",
+                    action="finish",
+                    finish_reason="完成",
+                ),
+            ]
+
+        async def decide(self, *_args, **_kwargs):
+            return self.decisions.pop(0), "fake-head"
+
+    class Retriever:
+        @staticmethod
+        def availability():
+            return {}
+
+    class NoWeb:
+        @staticmethod
+        def available():
+            return False
+
+    class CapturingResponseAgent:
+        def __init__(self) -> None:
+            self.request = None
+
+        async def execute(self, request, _on_retry=None):
+            self.request = request
+            return AgentWorkResult(
+                agent="implementation_agent",
+                draft_answer="C++ 实现",
+                used_evidence_ids=["W1"],
+            ), "fake-worker"
+
+    class PromptBuilder:
+        @staticmethod
+        def build(*_args):
+            return ""
+
+    response = CapturingResponseAgent()
+    runtime = AdaptiveAgentRuntime(
+        FakeCoordinator(),
+        response,
+        Retriever(),
+        NoWeb(),
+        object(),
+        object(),
+        PromptBuilder(),
+        max_iterations=2,
+    )
+    result = asyncio.run(runtime.run(
+        user_id=1,
+        session_id=1,
+        task_spec=continuation,
+        snapshot=ContextSnapshot.model_construct(memory=MemorySnapshot()),
+        conversation_context=[
+            ConversationMessage(role="assistant", content="未经核验的旧回答"),
+        ],
+        durable_memory=[],
+        previous_turn_evidence=[previous],
+    ))
+
+    assert result[1][0].metadata["carried_from_previous_turn"] is True
+    assert response.request.rag_evidence[0].content == "官方题面、约束和函数签名"
+    assert response.request.conversation_context[0].content == "未经核验的旧回答"
+
+
+def test_code_generation_fallback_routes_to_implementation_agent() -> None:
+    task = make_task_spec().model_copy(update={"primary_intent": "code_generation"})
+
+    assert AdaptiveAgentRuntime._fallback_execution_agent(task) == "implementation_agent"
+    assert CoordinatorAgent._fallback_execution_agent(task) == "implementation_agent"
+
+
+def test_contest_code_continuation_requires_solution_source_search() -> None:
+    task = make_task_spec().model_copy(update={
+        "primary_intent": "code_generation",
+        "context_plan": ContextPlan(recent_messages=True, task_state=True),
+    })
+    delegate = HeadDecision(
+        iteration=1,
+        rationale="官方题面足够",
+        action="delegate",
+        selected_agent="implementation_agent",
+        task_instruction="直接生成代码",
+    )
+    state = {
+        "actions_taken": [],
+        "execution_mode": "rag_assisted",
+        "rag_status": "not_checked",
+        "evidence": [{
+            "collection": "web_search",
+            "title": "LeetCode 官方题面",
+            "metadata": {"source_type": "leetcode_official"},
+        }],
+    }
+
+    with pytest.raises(ValueError, match="请先 search_web"):
+        CoordinatorAgent._validate(delegate, state, task, True)
+
+    searched = {
+        **state,
+        "actions_taken": [{
+            "iteration": 1,
+            "action": "search_web",
+            "web_query": "题号 灵茶山艾府 题解 C++",
+        }],
+    }
+    CoordinatorAgent._validate(delegate, searched, task, True)
+
+
+def test_rag_assisted_code_must_be_verified_after_latest_implementation() -> None:
+    task = make_task_spec().model_copy(update={
+        "primary_intent": "code_generation",
+        "context_plan": ContextPlan(recent_messages=True, task_state=False),
+    })
+    finish = HeadDecision(
+        iteration=3,
+        rationale="代码已生成",
+        action="finish",
+        finish_reason="准备交付",
+    )
+    stale = {
+        "actions_taken": [],
+        "execution_mode": "rag_assisted",
+        "rag_status": "hit",
+        "latest_work_result": {"needs_follow_up": False},
+        "work_history": [{"agent": "implementation_agent"}],
+        "evidence": [{"collection": "code_cases", "metadata": {}}],
+    }
+
+    with pytest.raises(ValueError, match="必须先由 verification_agent"):
+        CoordinatorAgent._validate(finish, stale, task, True)
+
+    verified = {
+        **stale,
+        "work_history": [
+            {"agent": "implementation_agent"},
+            {"agent": "verification_agent"},
+        ],
+    }
+    CoordinatorAgent._validate(finish, verified, task, True)
+
+
+def test_native_generated_problem_is_forced_through_verification() -> None:
+    generated_task = TaskSpec(
+        primary_intent="problem_solving",
+        normalized_request="出两道动态规划难题",
+        user_goal="获得两道动态规划练习题",
+        recognition_summary="用户请求生成算法练习题",
+        response_mode="direct_answer",
+        delivery=DeliverySpec(assistance_level="direct_solution"),
+        routing=RoutingPlan(primary_capability="algorithm_tutoring"),
+        context_plan=ContextPlan(recent_messages=True, task_state=False),
+        confidence=0.95,
+    )
+
+    class FakeCoordinator:
+        def __init__(self) -> None:
+            self.decisions = [
+                HeadDecision(
+                    iteration=1,
+                    rationale="题库不足，转为自拟题",
+                    action="retrieve_rag",
+                    rag_query=RagQuery(
+                        collection="problem_bank",
+                        query="动态规划 困难",
+                        reason="寻找真实题目",
+                    ),
+                ),
+                HeadDecision(
+                    iteration=2,
+                    rationale="题库未命中",
+                    action="switch_to_native_reasoning",
+                ),
+                HeadDecision(
+                    iteration=3,
+                    rationale="生成自拟题",
+                    action="delegate",
+                    selected_agent="problem_solving_agent",
+                    task_instruction="生成并标注两道自拟题",
+                ),
+                HeadDecision(
+                    iteration=4,
+                    rationale="草稿已生成",
+                    action="finish",
+                    finish_reason="准备交付",
+                ),
+            ]
+
+        async def decide(self, *_args, **_kwargs):
+            return self.decisions.pop(0), "fake-head"
+
+    class EmptyRetriever:
+        @staticmethod
+        def availability():
+            return {"problem_bank": True, "algorithm_concepts": True, "code_cases": True}
+
+        @staticmethod
+        def retrieve(_query):
+            return []
+
+    class NoWeb:
+        @staticmethod
+        def available():
+            return False
+
+    class FakeResponseAgent:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def execute(self, request, _on_retry=None):
+            self.requests.append(request)
+            agent = request.coordinator_plan.selected_agent
+            return AgentWorkResult(
+                agent=agent,
+                draft_answer=(
+                    "两道自拟题草稿"
+                    if agent == "problem_solving_agent"
+                    else "已重算样例并返回修正后的两道自拟题"
+                ),
+            ), "fake-worker"
+
+    class PromptBuilder:
+        @staticmethod
+        def build(*_args):
+            return ""
+
+    response_agent = FakeResponseAgent()
+    runtime = AdaptiveAgentRuntime(
+        FakeCoordinator(),
+        response_agent,
+        EmptyRetriever(),
+        NoWeb(),
+        object(),
+        object(),
+        PromptBuilder(),
+        max_iterations=4,
+    )
+
+    result = asyncio.run(runtime.run(
+        user_id=1,
+        session_id=100,
+        task_spec=generated_task,
+        snapshot=ContextSnapshot.model_construct(memory=MemorySnapshot()),
+        conversation_context=[{"role": "assistant", "content": "旧的错误题目"}],
+        durable_memory=[],
+    ))
+
+    work_result = result[2]
+    assert work_result.agent == "verification_agent"
+    assert [item.coordinator_plan.selected_agent for item in response_agent.requests] == [
+        "problem_solving_agent",
+        "verification_agent",
+    ]
+    assert response_agent.requests[0].conversation_context == []
+
+
+def test_duplicate_rag_results_remain_available_after_native_switch() -> None:
+    from app.models import RagEvidence
+
+    target: list[RagEvidence] = []
+    candidate = RagEvidence(
+        evidence_id="source",
+        collection="problem_bank",
+        title="真实动态规划难题",
+        content="题目正文与约束",
+        score=0.91,
+    )
+
+    first_added = AdaptiveAgentRuntime._merge_evidence(target, [candidate], "R")
+    second_added = AdaptiveAgentRuntime._merge_evidence(target, [candidate], "R")
+
+    assert first_added == 1
+    assert second_added == 0
+    assert len(target) == 1
+    assert target[0].evidence_id == "R1"

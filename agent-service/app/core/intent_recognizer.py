@@ -2,14 +2,18 @@ import re
 
 from app.models import (
     ConversationMessage,
+    ContextPlan,
+    DeliverySpec,
+    InputArtifacts,
     InputRewriteResult,
     IntentEntity,
+    RoutingPlan,
     TaskSpec,
 )
 from app.core.code_artifact import CodeArtifact, extract_code_artifact
 from app.core.model_client import IntentModelClient
 from app.core.model_client import RetryCallback
-from app.core.reflection import complete_with_reflection
+from app.core.reflection import AgentProtocolExhaustedError, complete_with_reflection
 
 
 SYSTEM_PROMPT = """你是算法学习平台的用户意图识别器。你的唯一任务是分析请求，不回答问题、不解题、不生成代码。
@@ -103,7 +107,41 @@ general_code_review 是可直接执行的 code_diagnosis/code_review 请求，�
    “周赛”默认指 Weekly Contest；“双周赛”只有在用户明确提及时才成立。不得自行假设周六和周日
    各有一场周赛，也不得要求用户提供可联网查到的场次编号。
 4. 对上述请求应保留 recent_messages，使用 knowledge_retrieval 能力，并把检索目标赛事、核验题号、
-   讲解题目写入 success_criteria；不确定的公开事实可写入 risk_flags，但不能设为阻塞性追问。"""
+   讲解题目写入 success_criteria；不确定的公开事实可写入 risk_flags，但不能设为阻塞性追问。
+
+特殊情况识别规则：
+5. 多意图请求选择对最终交付最关键的 primary_intent，其余放 secondary_intents。例如“修复代码并解释复杂度”通常以
+   code_diagnosis 为主、complexity_analysis 为辅；不得丢失任何明确子任务，expected_outputs 和 success_criteria 要覆盖全部。
+6. 区分“想学习概念”“要求提示”“要求完整解法”“要求生成代码”“已有代码查错”“只做代码审查”。用户已有代码时，
+   “为什么不对/报错/过不了”是 code_diagnosis；没有代码但要求实现是 code_generation 或 problem_solving。
+7. assistance_level 必须服从用户边界：“只提示”=hint_only，“不要答案只解释”=explanation_only，“只审查不改”=review_only，
+   “直接给完整代码/答案”=direct_solution，“一步步问我”=interactive_guidance，“只要计划”=plan_only。不得默认泄露更深答案。
+8. 题面不完整不一定阻塞：如果用户只问其中一个明确概念或代码局部，可以在现有范围内执行；只有缺失信息会改变核心
+   结论或所有可行方案时才 clarification_first，并只问一个最小必要问题。
+9. “分析一下”“看看”“评价一下”属于可执行的通用请求。结合工件类型选择 code_review、step_by_step_explanation 或
+   direct_answer；不得因为评价维度未写全就机械追问，可在 success_criteria 中采用常见且可验证的质量维度。
+10. 错误信息可能来自编译、运行时、逻辑错误、超时或内存超限；将原始错误放入 input_artifacts.error_message，不能根据
+    一句“没过”虚构具体异常。测试用例只收录用户实际提供的输入输出或反例。
+11. 用户要求比较时 primary_intent=solution_comparison；比较对象、维度和偏好写入 entities/constraints。若对象已明确但维度
+    未指定，可使用正确性、复杂度、可读性和适用条件等通用维度，不必追问。
+12. 学习路线、复习计划和能力评估分别关注目标、期限、当前水平与可用时间。缺少期限时可以给弹性计划并列为 ambiguity；
+    不得擅自假设用户是初学者、面试者或竞赛选手。
+13. 当前输入若只是在确认、拒绝或修正上一轮方案，normalized_request 必须合并最近有效任务和本轮变化，不能只写“好的”
+    或“不是”；若本轮开启了明确新任务，则旧任务不得继续混入。
+14. 用户上传文件、图片或网页但本轮载荷中没有其正文时，只记录可见工件引用和用户动作，不得声称已读取内容；将内容
+    不可见列为 risk_flag，只有确实阻塞时才追问重新提供。
+15. 用户要求“不要测试/不要修改/只分析/直接启动”等属于执行范围约束，不等于主要算法意图；保留在 constraints，并让
+    success_criteria 精确反映允许和禁止的操作。
+16. normalized_request、user_goal、expected_outputs 与 success_criteria 必须互相一致；不得出现前面识别“只提示”、后面却要求
+    完整代码，或前面识别中国站、后面却要求国际站的字段冲突。
+17. “出几道题、来两道题、找练习题、推荐下一题”属于 learning_consultation，主要能力使用 knowledge_retrieval，
+    tool_requirements 包含 knowledge_base，context_plan.user_learning_profile=true、algorithm_knowledge=true。用户只要求出题时，
+    expected_outputs 只包含真实题目、难度和链接或必要题面，不得擅自扩展成完整解法、证明和代码；只有用户明确要求解析时才加入。
+9. 用户用“每道题/这些题/上一场”继续上一轮题单并要求 C++ 代码时，识别为 code_generation，include_code=true，
+   assistance_level=direct_solution，context_plan.recent_messages=true 且 task_state=true。normalized_request 和 user_goal 要明确
+   这是为上一轮题单逐题实现，不要求用户重复提供可由上下文与联网工具重新核验的公开题号。
+18. 自包含的新请求应设置 context_plan.task_state=false，通常不需要旧助手回答。只有“继续上题、按刚才的方法、修改上一版”
+    等明确依赖未完成任务或指代时才设置 task_state=true；不能因为会话存在历史就自动把旧 assistant 内容当作本轮事实来源。"""
 
 
 class IntentRecognizer:
@@ -139,25 +177,133 @@ class IntentRecognizer:
             code_artifact,
             input_rewrite,
         )
-        task_spec, provider, _ = await complete_with_reflection(
-            model_client=self.model_client,
-            agent_name="意图识别 Agent",
-            system_prompt=SYSTEM_PROMPT,
-            request_payload=request_payload,
-            model_type=TaskSpec,
-            on_retry=on_retry,
-            max_tokens=1400,
-            max_reflection_rounds=self.max_reflection_rounds,
-            validator=lambda value: self._validate_task_spec(
-                value,
+        try:
+            task_spec, provider, _ = await complete_with_reflection(
+                model_client=self.model_client,
+                agent_name="意图识别 Agent",
+                system_prompt=SYSTEM_PROMPT,
+                request_payload=request_payload,
+                model_type=TaskSpec,
+                on_retry=on_retry,
+                max_tokens=1400,
+                max_reflection_rounds=self.max_reflection_rounds,
+                validator=lambda value: self._validate_task_spec(
+                    value,
+                    semantic_message,
+                    history,
+                ),
+            )
+        except AgentProtocolExhaustedError as error:
+            task_spec = self._continuation_code_fallback(
                 semantic_message,
                 history,
-            ),
-        )
+                input_rewrite,
+            )
+            if task_spec is None:
+                raise
+            provider = (
+                f"{error.provider}+reflection-exhausted+"
+                "continuation-code-fallback"
+            )
 
         if code_artifact is not None:
             task_spec = self._inject_code_artifact(task_spec, code_artifact)
         return task_spec, provider
+
+    @staticmethod
+    def _continuation_code_fallback(
+        message: str,
+        history: list[ConversationMessage],
+        input_rewrite: InputRewriteResult | None,
+    ) -> TaskSpec | None:
+        semantic = " ".join(
+            part
+            for part in (
+                message,
+                input_rewrite.formatted_input if input_rewrite else "",
+            )
+            if part
+        )
+        requests_code = bool(re.search(
+            r"(?:c\+\+|cpp|代码|实现|code)",
+            semantic,
+            flags=re.IGNORECASE,
+        ))
+        continuation = bool(re.search(
+            r"(?:每道题|每一题|这些题|上述题|上一题|上一轮|刚才|继续)",
+            semantic,
+            flags=re.IGNORECASE,
+        ))
+        has_prior_task = any(
+            item.role in {"user", "assistant"} and item.content.strip()
+            for item in history
+        )
+        if not (requests_code and continuation and has_prior_task):
+            return None
+
+        language = "C++" if re.search(
+            r"(?:c\+\+|cpp)", semantic, flags=re.IGNORECASE
+        ) else None
+        normalized = (
+            input_rewrite.formatted_input.strip()
+            if input_rewrite and input_rewrite.formatted_input.strip()
+            else message.strip()
+        )
+        constraints = list(input_rewrite.constraints) if input_rewrite else []
+        entities = [IntentEntity(
+            type="problem",
+            value="上一轮列出的每道题",
+            role="续问目标",
+        )]
+        if language:
+            entities.append(IntentEntity(
+                type="programming_language",
+                value=language,
+                role="目标代码语言",
+            ))
+        return TaskSpec(
+            primary_intent="code_generation",
+            normalized_request=normalized,
+            user_goal=f"为上一轮列出的每道题提供{language or '完整'}代码实现",
+            recognition_summary="用户明确续问上一轮题单，要求逐题生成代码实现。",
+            entities=entities,
+            input_artifacts=InputArtifacts(programming_language=language),
+            constraints=constraints,
+            response_mode="direct_answer",
+            delivery=DeliverySpec(
+                assistance_level="direct_solution",
+                explanation_depth="standard",
+                response_language="zh-CN",
+                expected_outputs=[
+                    "逐题对应的算法思路",
+                    f"每道题的{language or '完整'}代码",
+                    "每道题的复杂度与验证说明",
+                    "实际使用的参考资料链接",
+                ],
+                include_code=True,
+            ),
+            routing=RoutingPlan(
+                primary_capability="code_sandbox",
+                supporting_capabilities=["knowledge_retrieval"],
+                execution_mode="sequential",
+                recommended_sequence=["knowledge_retrieval", "code_sandbox"],
+                tool_requirements=["knowledge_base", "code_sandbox"],
+            ),
+            context_plan=ContextPlan(
+                recent_messages=True,
+                task_state=True,
+                algorithm_knowledge=True,
+            ),
+            success_criteria=[
+                "重新核验上一轮每道公开题目的题面与对应关系",
+                f"为每道题提供相互独立且与题面匹配的{language or '完整'}实现",
+                "检查函数签名、样例、边界和复杂度",
+                "给出实际使用的可点击参考链接",
+            ],
+            ambiguities=[],
+            risk_flags=["旧 assistant 回答不是事实证据，公开题号和题面需要工具证据核验"],
+            confidence=0.88,
+        )
 
     @classmethod
     def _validate_task_spec(

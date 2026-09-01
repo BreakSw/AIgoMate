@@ -45,6 +45,11 @@ public class ChatSession {
     }
 
     public void rename(String title) { this.title = title; }
+    public void resetConversation() {
+        this.title = "新的算法探索";
+        this.summary = null;
+        touch();
+    }
     public void touch() { this.updatedAt = Instant.now(); }
 
     public Long getId() { return id; }
@@ -54,4 +59,3 @@ public class ChatSession {
     public Instant getCreatedAt() { return createdAt; }
     public Instant getUpdatedAt() { return updatedAt; }
 }
-

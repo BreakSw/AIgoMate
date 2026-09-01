@@ -3,9 +3,10 @@ from app.core.context_manager import ContextManager
 from app.core.intent_recognizer import IntentRecognizer
 from app.core.input_rewriter import UserInputRewriteAgent
 from app.core.input_organizer import InputOrganizerAgent
+from app.core.learning_profile import LearningProfileService
 from app.core.memory_agent import MemoryObserverAgent
 from app.core.memory_store import UserMemoryRepository
-from app.core.model_client import RetryCallback
+from app.core.model_client import IntentModelClient, RetryCallback
 from app.core.output_format_agent import OutputFormattingAgent
 from app.core.polish_agent import LanguagePolishAgent
 from app.core.progress_status import ProgressCallback
@@ -31,10 +32,12 @@ class AgentOrchestrator:
         intent_recognizer: IntentRecognizer,
         memory_observer: MemoryObserverAgent,
         memory_repository: UserMemoryRepository,
+        learning_profile_service: LearningProfileService,
         adaptive_runtime: AdaptiveAgentRuntime,
         polish_agent: LanguagePolishAgent,
         output_format_agent: OutputFormattingAgent,
         model: str,
+        model_client: IntentModelClient | None = None,
     ) -> None:
         self.context_manager = context_manager
         self.input_organizer = input_organizer
@@ -42,10 +45,18 @@ class AgentOrchestrator:
         self.intent_recognizer = intent_recognizer
         self.memory_observer = memory_observer
         self.memory_repository = memory_repository
+        self.learning_profile_service = learning_profile_service
         self.adaptive_runtime = adaptive_runtime
         self.polish_agent = polish_agent
         self.output_format_agent = output_format_agent
         self.model = model
+        self.model_client = model_client
+
+    @property
+    def current_model(self) -> str:
+        if self.model_client is None:
+            return self.model
+        return self.model_client.current_model
 
     async def respond(
         self,
@@ -53,6 +64,15 @@ class AgentOrchestrator:
         on_retry: RetryCallback | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> AgentResponse:
+        if not request.history and request.previous_context_snapshot is None:
+            # SQLite session ids can be reused after a local database reset.
+            # A first turn always starts a fresh memory scope, so an old JSON
+            # file with the same numeric id can never leak into the new chat.
+            await self.memory_repository.reset_session(
+                request.user_id,
+                request.session_id,
+            )
+
         async def checkpoint_hook(memory: MemorySnapshot, stage: str) -> None:
             await self.memory_repository.checkpoint_snapshot(
                 request.user_id,
@@ -137,6 +157,22 @@ class AgentOrchestrator:
         })
         await self._progress(
             on_progress,
+            "learning_profile",
+            "正在分析个性化学习状态",
+            "个性化学习建模 Agent",
+            "仅依据明确学习反馈更新 BKT、IRT 与 FSRS-style 状态",
+        )
+        learning_profile = await self.learning_profile_service.process_turn(
+            request.user_id,
+            request.session_id,
+            organized_input,
+            task_spec,
+        )
+        context_snapshot = context_snapshot.model_copy(
+            update={"learning_profile": learning_profile}
+        )
+        await self._progress(
+            on_progress,
             "memory_observation",
             "正在检查本轮是否需要更新记忆",
             "记忆观察 Agent",
@@ -173,6 +209,10 @@ class AgentOrchestrator:
                 )
             }
         )
+        previous_turn_evidence = self._continuation_evidence(
+            previous_snapshot,
+            task_spec,
+        )
         (
             coordinator_plan,
             rag_evidence,
@@ -187,6 +227,7 @@ class AgentOrchestrator:
             snapshot=context_snapshot,
             conversation_context=context,
             durable_memory=durable_memory,
+            previous_turn_evidence=previous_turn_evidence,
             on_retry=on_retry,
             on_progress=on_progress,
         )
@@ -235,6 +276,8 @@ class AgentOrchestrator:
             f"polish:{polish_provider}",
             f"format:{format_provider}",
         ]
+        if learning_profile.active:
+            model_call_trace.insert(4, "learning-profile:local-bkt-irt-fsrs")
         execution = AgentExecutionTrace(
             task_spec=task_spec,
             coordinator_plan=coordinator_plan,
@@ -250,13 +293,19 @@ class AgentOrchestrator:
             update={"agent_execution": execution}
         )
         combined_provider = " | ".join(model_call_trace)
+        learning_report = self.learning_profile_service.render_markdown(
+            learning_profile
+        )
+        final_content = format_result.formatted_answer
+        if learning_report:
+            final_content = f"{final_content.rstrip()}\n\n{learning_report}"
         return AgentResponse(
-            content=format_result.formatted_answer,
+            content=final_content,
             intent=task_spec.primary_intent,
             context_messages_used=len(context),
             task_spec=task_spec,
             context_snapshot=context_snapshot,
-            model=self.model,
+            model=self.current_model,
             provider=combined_provider,
         )
 
@@ -280,6 +329,23 @@ class AgentOrchestrator:
         if scope.user_id != request.user_id or scope.session_id != request.session_id:
             return None
         return snapshot
+
+    @staticmethod
+    def _continuation_evidence(
+        previous_snapshot: ContextSnapshot | None,
+        task_spec: TaskSpec,
+    ) -> list:
+        """Reuse actual prior tool evidence for an explicit continuation only.
+
+        The rendered assistant answer is never promoted to evidence. The source
+        entries below came from the previous execution trace and retain their
+        URLs, metadata, and original content for downstream re-validation.
+        """
+        if not task_spec.context_plan.task_state:
+            return []
+        if previous_snapshot is None or previous_snapshot.agent_execution is None:
+            return []
+        return list(previous_snapshot.agent_execution.rag_evidence)
 
     def _merge_durable_memory(
         self,
@@ -415,5 +481,5 @@ class AgentOrchestrator:
             f"完成条件：\n{criteria}\n\n"
             f"风险提示：\n{risks}\n\n"
             f"澄清问题：{clarification}\n"
-            f"识别模型：{self.model}（{provider}）"
+            f"识别模型：{self.current_model}（{provider}）"
         )

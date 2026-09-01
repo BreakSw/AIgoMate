@@ -78,10 +78,16 @@ public class ChatService {
      * 会长期占用唯一的数据库连接，阻塞其他会话的一切读写。现在拆分为三段：
      * 短事务保存用户消息 -> 无事务调用 agent -> 短事务保存回复。
      */
-    public ConversationResponse sendMessage(Long userId, Long sessionId, String content) {
+    public ConversationResponse sendMessage(Long userId,
+                                            Long sessionId,
+                                            String content) {
         PreparedIntent prepared = transactionTemplate.execute(
                 status -> prepareIntent(userId, sessionId, content));
-        String answer = agentClient.respond(userId, sessionId, prepared.prompt(), prepared.history());
+        String answer = agentClient.respond(
+                userId,
+                sessionId,
+                prepared.prompt(),
+                prepared.history());
         return transactionTemplate.execute(
                 status -> completeSimpleAnswer(userId, sessionId, prepared.userMessageId(), answer));
     }
@@ -160,6 +166,20 @@ public class ChatService {
         intentAnalysisRepository.deleteAllBySessionId(sessionId);
         messageRepository.deleteAllBySessionId(sessionId);
         sessionRepository.delete(session);
+    }
+
+    public ConversationResponse clearConversation(Long userId, Long sessionId) {
+        transactionTemplate.executeWithoutResult(
+                status -> requireSession(userId, sessionId));
+        agentClient.clearSessionMemory(userId, sessionId);
+        return transactionTemplate.execute(status -> {
+            ChatSession session = requireSession(userId, sessionId);
+            intentAnalysisRepository.deleteAllBySessionId(sessionId);
+            messageRepository.deleteAllBySessionId(sessionId);
+            session.resetConversation();
+            sessionRepository.save(session);
+            return new ConversationResponse(toSessionResponse(session), List.of());
+        });
     }
 
     private AppUser requireUser(Long userId) {

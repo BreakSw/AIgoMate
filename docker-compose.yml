@@ -1,6 +1,26 @@
 name: algomate
 
 services:
+  redis:
+    image: redis:7.4-alpine
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?请在 .env 中设置 REDIS_PASSWORD}"
+    command:
+      - sh
+      - -c
+      - 'exec redis-server --appendonly yes --requirepass "$${REDIS_PASSWORD}"'
+    volumes:
+      - redis-data:/data
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
   agent-service:
     build:
       context: .
@@ -11,11 +31,17 @@ services:
       APP_ENV: production
       USER_MEMORY_DIR: /app/agent-service/data/user-memory
       MILVUS_URI: /app/rag-data/vector/algomate-milvus.db
+      REDIS_URL: redis://redis:6379/0
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?请在 .env 中设置 REDIS_PASSWORD}"
+      MODEL_CONFIG_ENCRYPTION_KEY: "${MODEL_CONFIG_ENCRYPTION_KEY:?请在 .env 中设置 MODEL_CONFIG_ENCRYPTION_KEY}"
     volumes:
       - agent-memory:/app/agent-service/data
       - ./rag-data:/app/rag-data
     expose:
       - "8000"
+    depends_on:
+      redis:
+        condition: service_healthy
     healthcheck:
       test:
         - CMD
@@ -61,7 +87,7 @@ services:
       context: .
       dockerfile: frontend/Dockerfile
     ports:
-      - "${ALGOMATE_HTTP_PORT:-8080}:80"
+      - "127.0.0.1:${ALGOMATE_HTTP_PORT:-8080}:80"
     depends_on:
       backend:
         condition: service_healthy
@@ -76,3 +102,4 @@ services:
 volumes:
   agent-memory:
   backend-data:
+  redis-data:

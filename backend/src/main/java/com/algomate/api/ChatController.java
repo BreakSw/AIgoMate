@@ -61,7 +61,8 @@ public class ChatController {
     @PostMapping("/sessions/{sessionId}/messages")
     public ConversationResponse sendMessage(@PathVariable Long sessionId,
                                             @Valid @RequestBody SendMessageRequest request) {
-        return chatService.sendMessage(request.userId(), sessionId, request.content());
+        return chatService.sendMessage(
+                request.userId(), sessionId, request.content());
     }
 
     @PostMapping(
@@ -69,7 +70,8 @@ public class ChatController {
             produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter streamIntent(@PathVariable Long sessionId,
                                    @Valid @RequestBody SendMessageRequest request) {
-        return intentStreamService.stream(request.userId(), sessionId, request.content());
+        return intentStreamService.stream(
+                request.userId(), sessionId, request.content());
     }
 
     @PostMapping("/sessions/{sessionId}/messages/stream/cancel")
@@ -84,5 +86,13 @@ public class ChatController {
     public void deleteSession(@PathVariable Long sessionId,
                               @RequestParam(defaultValue = "1") Long userId) {
         chatService.deleteSession(userId, sessionId);
+    }
+
+    @DeleteMapping("/sessions/{sessionId}/content")
+    public ConversationResponse clearConversation(
+            @PathVariable Long sessionId,
+            @RequestParam(defaultValue = "1") Long userId) {
+        intentStreamService.cancel(userId, sessionId);
+        return chatService.clearConversation(userId, sessionId);
     }
 }

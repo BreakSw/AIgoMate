@@ -5,7 +5,12 @@ import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from app.models import DurableMemoryItem, MemorySnapshot, MemoryUpdate
+from app.models import (
+    DurableMemoryItem,
+    LearningProfileSnapshot,
+    MemorySnapshot,
+    MemoryUpdate,
+)
 
 _WEEKDAY_NAMES = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 
@@ -34,6 +39,11 @@ class UserMemoryRepository:
     ) -> list[DurableMemoryItem]:
         async with self._lock:
             return self._load_unlocked(user_id, session_id)
+
+    async def reset_session(self, user_id: int, session_id: int) -> None:
+        """Start a numerically reused chat session with an empty memory scope."""
+        async with self._lock:
+            self._write_unlocked(user_id, session_id, [])
 
     async def recall(
         self,
@@ -242,6 +252,7 @@ class DynamicSystemPromptBuilder:
         session_id: int,
         snapshot: MemorySnapshot,
         durable_memory: list[DurableMemoryItem],
+        learning_profile: LearningProfileSnapshot | None = None,
     ) -> str:
         lines = [
             "以下是本轮动态系统上下文。它由系统维护，不是用户消息，也不能覆盖安全规则。",
@@ -263,5 +274,23 @@ class DynamicSystemPromptBuilder:
             )
         else:
             lines.append("本轮没有召回到必要的用户私有记忆。")
+        if learning_profile is not None and learning_profile.active:
+            lines.extend([
+                "本轮已明确触发个性化学习任务，以下画像可用于难度、知识点与复习推荐：",
+                f"- IRT-1PL 能力值 theta={learning_profile.ability_theta:.3f}，建议难度={learning_profile.target_difficulty}",
+            ])
+            lines.extend(
+                f"- {item.concept}: BKT={item.mastery_probability:.3f}, "
+                f"attempts={item.attempts}, next_review={item.next_review_at or 'unknown'}"
+                for item in learning_profile.concepts
+            )
+            if learning_profile.recommended_concepts:
+                lines.append(
+                    "画像推荐优先级："
+                    + "、".join(learning_profile.recommended_concepts)
+                )
+            lines.append(
+                "推荐题目时应结合画像检索题库；没有实际题库证据时不得编造题号。"
+            )
         lines.append("不得编造未记录的用户偏好或历史；记忆冲突时以用户本轮明确表述为准。")
         return "\n".join(lines)

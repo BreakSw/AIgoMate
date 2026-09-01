@@ -238,6 +238,69 @@ class MemoryScope(BaseModel):
     session_id: int
 
 
+LearningOutcome = Literal[
+    "correct",
+    "incorrect",
+    "hinted",
+    "solution_viewed",
+    "reviewed",
+]
+LearningDifficulty = Literal["easy", "medium", "hard", "unknown"]
+
+
+class LearningObservation(BaseModel):
+    concept: str
+    outcome: LearningOutcome
+    difficulty: LearningDifficulty = "unknown"
+    confidence: float = Field(default=0.8, ge=0, le=1)
+    evidence: str
+
+
+class LearningUpdateTrace(BaseModel):
+    concept: str
+    outcome: LearningOutcome
+    mastery_before: float = Field(ge=0, le=1)
+    mastery_after: float = Field(ge=0, le=1)
+    ability_before: float
+    ability_after: float
+    predicted_success: float = Field(ge=0, le=1)
+    fsrs_rating: Literal["Again", "Hard", "Good", "Easy"]
+    next_review_at: str
+
+
+class LearningConceptState(BaseModel):
+    concept: str
+    mastery_probability: float = Field(ge=0, le=1)
+    attempts: int = Field(ge=0)
+    correct_attempts: int = Field(ge=0)
+    hint_count: int = Field(ge=0)
+    fsrs_difficulty: float = Field(ge=1, le=10)
+    fsrs_stability_days: float = Field(ge=0)
+    last_review_at: str | None = None
+    next_review_at: str | None = None
+    last_outcome: LearningOutcome | None = None
+    priority_score: float = Field(default=0, ge=0)
+
+
+class LearningProfileSnapshot(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
+    active: bool = False
+    updated: bool = False
+    scope: Literal["user_learning_profile"] = "user_learning_profile"
+    user_id: int
+    session_id: int
+    ability_theta: float = 0
+    target_difficulty: LearningDifficulty = "medium"
+    summary: str
+    observations: list[LearningObservation] = Field(default_factory=list)
+    updates: list[LearningUpdateTrace] = Field(default_factory=list)
+    concepts: list[LearningConceptState] = Field(default_factory=list)
+    recommended_concepts: list[str] = Field(default_factory=list)
+    algorithms: list[str] = Field(
+        default_factory=lambda: ["BKT", "IRT-1PL", "FSRS-style"]
+    )
+
+
 class ContextSnapshot(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     memory: MemorySnapshot
@@ -248,6 +311,7 @@ class ContextSnapshot(BaseModel):
     input_rewrite: InputRewriteResult | None = None
     agent_execution: "AgentExecutionTrace | None" = None
     memory_scope: MemoryScope | None = None
+    learning_profile: LearningProfileSnapshot | None = None
     # Memory frozen at the last compaction boundary. Active `memory` can keep
     # advancing every turn without changing what the checkpoint represents.
     checkpoint_memory: MemorySnapshot | None = None

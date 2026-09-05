@@ -18,6 +18,7 @@ class AgentProtocolExhaustedError(ValueError):
         agent_name: str,
         reflection_rounds: int,
         provider: str = "unknown-provider",
+        validation_feedback: str | None = None,
     ) -> None:
         super().__init__(
             f"{agent_name} 连续 {reflection_rounds} 轮自我修正后仍未通过输出协议"
@@ -25,6 +26,7 @@ class AgentProtocolExhaustedError(ValueError):
         self.agent_name = agent_name
         self.reflection_rounds = reflection_rounds
         self.provider = provider
+        self.validation_feedback = validation_feedback
 
 
 async def complete_with_reflection(
@@ -64,6 +66,7 @@ async def complete_with_reflection(
                     agent_name,
                     max_reflection_rounds,
                     provider,
+                    _safe_validation_feedback(error),
                 ) from error
             reflection_payload = {
                 "original_request": request_payload,

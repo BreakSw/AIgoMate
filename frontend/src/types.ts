@@ -309,7 +309,7 @@ export interface HeadDecision {
   schema_version: '1.0'
   iteration: number
   rationale: string
-  action: 'retrieve_rag' | 'search_web' | 'delegate' | 'persist_memory' | 'ask_clarification' | 'finish'
+  action: 'get_current_time' | 'retrieve_rag' | 'switch_to_native_reasoning' | 'search_web' | 'execute_code_tests' | 'delegate' | 'persist_memory' | 'ask_clarification' | 'finish'
   selected_agent?: string | null
   task_instruction?: string | null
   rag_query?: RagQuery | null
@@ -347,6 +347,29 @@ export interface PolishResult {
   added_factual_claims: boolean
 }
 
+export interface CodeExecutionReport {
+  protocol_version: '1.0'
+  provider: 'judge0-sdk'
+  source_code_hash: string
+  language: string
+  overall_status: 'passed' | 'failed' | 'unavailable' | 'unsupported' | 'error'
+  verdict: string
+  passed_tests: number
+  total_tests: number
+  test_categories: string[]
+  oracle_strategy: string
+  semantic_reflection_rounds: number
+  test_plan_review?: string | null
+  test_plan_review_confidence?: number | null
+  stdout?: string | null
+  stderr?: string | null
+  compile_output?: string | null
+  exit_code?: number | null
+  time_seconds?: number | null
+  memory_kb?: number | null
+  failure_reason?: string | null
+}
+
 export interface AgentExecutionTrace {
   protocol_version: '1.0'
   task_spec: TaskSpec
@@ -357,6 +380,7 @@ export interface AgentExecutionTrace {
   durable_memory?: DurableMemoryItem[]
   memory_updates?: MemoryUpdate[]
   model_call_trace?: string[]
+  code_execution_reports?: CodeExecutionReport[]
 }
 
 export interface IntentResult {

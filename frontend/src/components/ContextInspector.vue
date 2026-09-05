@@ -52,6 +52,12 @@ const agentLabels: Record<string, string> = {
   tutoring_agent: '算法教学 Agent',
   problem_solving_agent: '问题求解 Agent',
   code_analysis_agent: '代码分析 Agent',
+  problem_structuring_agent: '题面结构化 Agent',
+  strategy_agent: '算法策略 Agent',
+  solution_review_agent: '方案评审 Agent',
+  implementation_agent: '代码实现 Agent',
+  verification_agent: '验证 Agent',
+  code_test_generation_agent: '算法测试生成 Agent',
   learning_planning_agent: '学习规划 Agent',
   conversation_agent: '通用对话 Agent',
   clarification_agent: '澄清 Agent',
@@ -66,12 +72,12 @@ function agentLabel(value: string) {
 }
 
 function reflectionRounds(value: string) {
-  const match = value.match(/\+reflection:(\d+)/)
+  const match = value.match(/\+(?:reflection|test-reflection):(\d+)/)
   return match ? Number(match[1]) : 0
 }
 
 function callLabel(value: string) {
-  return value.replace(/\+reflection:\d+/, '')
+  return value.replace(/\+(?:reflection|test-reflection):\d+/, '')
 }
 
 function difficultyLabel(value: string) {
@@ -225,6 +231,26 @@ function reviewDate(value?: string | null) {
         </div>
       </section>
 
+      <section v-if="snapshot.agent_execution?.code_execution_reports?.length" class="execution-card">
+        <header>
+          <span><small>CODE EXECUTION TOOL</small><strong>Judge0 真实编译运行</strong></span>
+          <b>{{ snapshot.agent_execution.code_execution_reports.at(-1)?.overall_status }}</b>
+        </header>
+        <div v-for="report in snapshot.agent_execution.code_execution_reports" :key="report.source_code_hash" class="execution-report">
+          <div class="execution-summary">
+            <span><small>语言</small><strong>{{ report.language }}</strong></span>
+            <span><small>Verdict</small><strong>{{ report.verdict }}</strong></span>
+            <span><small>用例</small><strong>{{ report.passed_tests }}/{{ report.total_tests }}</strong></span>
+            <span><small>耗时 / 内存</small><strong>{{ report.time_seconds ?? '—' }}s / {{ report.memory_kb ?? '—' }} KB</strong></span>
+          </div>
+          <p><strong>覆盖：</strong>{{ report.test_categories.join('、') || '未生成' }}</p>
+          <p><strong>Oracle：</strong>{{ report.oracle_strategy || '未提供' }}</p>
+          <p><strong>Reflection：</strong>语义修订 {{ report.semantic_reflection_rounds }} 轮<template v-if="report.test_plan_review"> · {{ report.test_plan_review }}</template><template v-if="report.test_plan_review_confidence != null">（置信度 {{ Math.round(report.test_plan_review_confidence * 100) }}%）</template></p>
+          <small class="source-hash">源码 SHA-256 · {{ report.source_code_hash }}</small>
+          <pre v-if="report.failure_reason || report.compile_output || report.stderr || report.stdout">{{ report.failure_reason || report.compile_output || report.stderr || report.stdout }}</pre>
+        </div>
+      </section>
+
       <section v-if="snapshot.agent_execution" class="evidence-card">
         <header>
           <span><small>GROUNDING EVIDENCE</small><strong>实际召回证据</strong></span>
@@ -349,7 +375,7 @@ function reviewDate(value?: string | null) {
 .rewrite-meta span { padding: 3px 6px; border-radius: 99px; color: #526c92; background: #edf2f8; font-size: 8px; }
 .rewrite-meta span.ambiguity { color: #8a6539; background: #f7eedf; }
 .rewrite-provider { display: block; margin-top: 8px; color: #a1a5ad; font-size: 8px; }
-.intent-card, .learning-profile-card, .orchestration-card, .evidence-card, .polish-card { padding: 12px; border: 1px solid #dce1e8; border-radius: 10px; background: #fff; }
+.intent-card, .learning-profile-card, .orchestration-card, .execution-card, .evidence-card, .polish-card { padding: 12px; border: 1px solid #dce1e8; border-radius: 10px; background: #fff; }
 .intent-card header, .orchestration-card header, .evidence-card header, .polish-card header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .intent-card header > span, .orchestration-card header > span, .evidence-card header > span, .polish-card header > span { display: grid; gap: 2px; }
 .intent-card header small, .orchestration-card header small, .evidence-card header small, .polish-card header small { color: #6b89b4; font-size: 8px; letter-spacing: .12em; }
@@ -402,6 +428,20 @@ function reviewDate(value?: string | null) {
 .memory-write-list { display: grid; gap: 5px; margin-top: 10px; padding-top: 9px; border-top: 1px solid #ebe8e0; }
 .memory-write-list strong { color: #59667a; font-size: 9px; }
 .memory-write-list span { padding: 5px 7px; border-radius: 7px; color: #526556; background: #edf4ef; font-size: 8px; }
+.execution-card { border-left: 3px solid #5e8c79; background: linear-gradient(105deg, #f4faf7, #fffaf2); }
+.execution-card header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.execution-card header > span { display: grid; gap: 2px; }
+.execution-card header small { color: #4f806f; font-size: 8px; letter-spacing: .12em; }
+.execution-card header strong { color: #34445c; font-size: 11px; }
+.execution-card header b { padding: 4px 7px; border-radius: 99px; color: #315e9d; background: #e9f0f9; font-size: 8px; }
+.execution-report { margin-top: 9px; padding-top: 9px; border-top: 1px solid #dfe9e4; }
+.execution-summary { display: grid; grid-template-columns: .7fr 1fr .7fr 1.4fr; gap: 6px; }
+.execution-summary span { display: grid; gap: 2px; padding: 7px; border-radius: 7px; background: rgba(255,255,255,.84); }
+.execution-summary small, .source-hash { color: #87939a; font-size: 8px; }
+.execution-summary strong { color: #405169; font-size: 9px; }
+.execution-report p { margin: 7px 0 0; color: #536073; font-size: 9px; line-height: 1.5; }
+.source-hash { display: block; margin-top: 7px; overflow-wrap: anywhere; }
+.execution-report pre { max-height: 160px; margin: 7px 0 0; padding: 8px; overflow: auto; border-radius: 7px; color: #7b4935; background: #fff3e8; font: 8px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
 .evidence-card { background: #f8fafc; }
 .empty-evidence { margin: 9px 0 0; color: #8c939e; font-size: 9px; }
 .evidence-row { display: flex; gap: 8px; margin-top: 8px; padding-top: 8px; border-top: 1px solid #e5e9ef; }

@@ -1,7 +1,15 @@
 import asyncio
+import hashlib
+from typing import Literal, TypedDict
 
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import END, START, StateGraph
+
+from app.core.code_artifact import extract_code_artifact, normalize_language
+from app.core.code_test_generation_agent import CodeTestGenerationAgent
 from app.core.coordinator_agent import CoordinatorAgent
 from app.core.current_time_tool import CurrentTimeTool
+from app.core.judge0_code_runner import Judge0CodeRunner
 from app.core.memory_store import DynamicSystemPromptBuilder, UserMemoryRepository
 from app.core.model_client import RetryCallback
 from app.core.progress_status import ProgressCallback
@@ -11,6 +19,7 @@ from app.core.web_search_agent import WebSearchAgent
 from app.models import (
     AgentWorkRequest,
     AgentWorkResult,
+    CodeExecutionReport,
     ContextSnapshot,
     ConversationMessage,
     CoordinatorPlan,
@@ -24,8 +33,51 @@ from app.models import (
 )
 
 
+class AdaptiveRuntimeState(TypedDict):
+    """In-memory LangGraph state for one isolated chat turn.
+
+    The graph deliberately has no persistent checkpointer: conversation and
+    durable-memory persistence remain owned by the existing context and memory
+    services, preserving the public behavior and session-isolation guarantees.
+    """
+
+    user_id: int
+    session_id: int
+    task_spec: TaskSpec
+    snapshot: ContextSnapshot
+    conversation_context: list[ConversationMessage]
+    durable_memory: list[DurableMemoryItem]
+    on_retry: RetryCallback | None
+    on_progress: ProgressCallback | None
+    iteration: int
+    decisions: list[HeadDecision]
+    evidence: list[RagEvidence]
+    observations: list[str]
+    rag_queries: list[RagQuery]
+    web_queries: list[str]
+    known_limits: list[str]
+    memory_updates: list[MemoryUpdate]
+    providers: list[str]
+    code_execution_reports: list[CodeExecutionReport]
+    latest_work_result: AgentWorkResult | None
+    work_history: list[AgentWorkResult]
+    execution_mode: Literal["rag_assisted", "native_reasoning"]
+    rag_status: Literal[
+        "not_checked",
+        "candidate_found",
+        "hit",
+        "miss",
+        "insufficient",
+        "unavailable",
+        "error",
+    ]
+    last_instruction: str
+    dynamic_prompt: str
+    current_decision: HeadDecision | None
+
+
 class AdaptiveAgentRuntime:
-    """Model-directed agent loop. The head model chooses every next action."""
+    """LangGraph-directed agent runtime. The head model chooses every action."""
 
     def __init__(
         self,
@@ -37,6 +89,8 @@ class AdaptiveAgentRuntime:
         memory_repository: UserMemoryRepository,
         prompt_builder: DynamicSystemPromptBuilder,
         max_iterations: int = 6,
+        code_test_generation_agent: CodeTestGenerationAgent | None = None,
+        judge0_code_runner: Judge0CodeRunner | None = None,
     ) -> None:
         self.coordinator = coordinator
         self.response_agent = response_agent
@@ -45,7 +99,16 @@ class AdaptiveAgentRuntime:
         self.current_time_tool = current_time_tool
         self.memory_repository = memory_repository
         self.prompt_builder = prompt_builder
+        coordinator_model_client = getattr(coordinator, "model_client", None)
+        self.code_test_generation_agent = code_test_generation_agent
+        if self.code_test_generation_agent is None and coordinator_model_client is not None:
+            self.code_test_generation_agent = CodeTestGenerationAgent(
+                coordinator_model_client,
+                3,
+            )
+        self.judge0_code_runner = judge0_code_runner or Judge0CodeRunner()
         self.max_iterations = max_iterations
+        self.graph = self._compile_graph()
 
     async def run(
         self,
@@ -59,6 +122,7 @@ class AdaptiveAgentRuntime:
         previous_turn_evidence: list[RagEvidence] | None = None,
         on_retry: RetryCallback | None = None,
         on_progress: ProgressCallback | None = None,
+        runnable_config: RunnableConfig | None = None,
     ) -> tuple[
         CoordinatorPlan,
         list[RagEvidence],
@@ -66,8 +130,8 @@ class AdaptiveAgentRuntime:
         list[DurableMemoryItem],
         list[MemoryUpdate],
         list[str],
+        list[CodeExecutionReport],
     ]:
-        decisions: list[HeadDecision] = []
         evidence: list[RagEvidence] = [
             item.model_copy(update={
                 "metadata": {
@@ -83,306 +147,57 @@ class AdaptiveAgentRuntime:
                 f"已载入上一轮 {len(evidence)} 条真实检索证据供续问复用；"
                 "旧 assistant 文本仍不是证据，新增交付要求需要检查现有证据是否足够。"
             )
-        rag_queries: list[RagQuery] = []
-        web_queries: list[str] = []
-        known_limits: list[str] = []
-        memory_updates: list[MemoryUpdate] = []
-        providers: list[str] = []
-        latest_work_result: AgentWorkResult | None = None
-        work_history: list[AgentWorkResult] = []
-        execution_mode = "rag_assisted"
-        rag_status = "not_checked"
-        last_instruction = task_spec.normalized_request
-
-        for iteration in range(1, self.max_iterations + 1):
-            head_message, head_detail = self._head_progress(
-                execution_mode,
-                rag_status,
-                work_history,
+        native_only = CoordinatorAgent._requests_native_only(task_spec)
+        if native_only:
+            observations.append(
+                "用户明确要求本轮跳过 RAG/网页检索，已直接进入算法自主推理模式。"
             )
-            await self._progress(
-                on_progress,
-                "head_decision",
-                head_message,
-                "首脑智能体",
-                head_detail,
-            )
-            dynamic_prompt = self.prompt_builder.build(
-                user_id,
-                session_id,
-                snapshot.memory,
-                durable_memory,
-                snapshot.learning_profile,
-            )
-            runtime_state = self._runtime_state(
-                decisions,
-                observations,
-                evidence,
-                latest_work_result,
-                work_history,
-                execution_mode,
-                rag_status,
-            )
-            runtime_state["iteration_budget"] = {
-                "current": iteration,
-                "maximum": self.max_iterations,
-                "remaining_after_this_decision": self.max_iterations - iteration,
-            }
-            decision, provider = await self.coordinator.decide(
+        graph_config: RunnableConfig = dict(runnable_config or {})
+        graph_config["recursion_limit"] = max(25, self.max_iterations * 3 + 5)
+        graph_state = await self.graph.ainvoke(
+            AdaptiveRuntimeState(
+                user_id=user_id,
+                session_id=session_id,
                 task_spec=task_spec,
                 snapshot=snapshot,
-                runtime_state=runtime_state,
-                knowledge_availability=self.rag_retriever.availability(),
-                web_search_available=self.web_search_agent.available(),
-                dynamic_system_prompt=dynamic_prompt,
-                iteration=iteration,
-                conversation_context=self._conversation_context_for_task(
-                    task_spec,
-                    conversation_context,
-                ),
+                conversation_context=conversation_context,
+                durable_memory=durable_memory,
                 on_retry=on_retry,
-            )
-            decisions.append(decision)
-            providers.append(f"head#{iteration}:{provider}")
-
-            if decision.action == "get_current_time":
-                await self._progress(
-                    on_progress,
-                    "time_tool",
-                    "正在读取应用当前时间",
-                    "时间工具",
-                    "把相对日期转换为可检索的绝对日期",
-                )
-                time_result = self.current_time_tool.read()
-                observations.append(
-                    "时间工具返回："
-                    f"当前日期时间 {time_result['local_datetime']}，"
-                    f"日期 {time_result['chinese_date']}，"
-                    f"星期 {time_result['weekday']}，"
-                    f"时区 {time_result['timezone']}（UTC{time_result['utc_offset']}）。"
-                    "后续涉及相对日期的检索必须使用该绝对日期。"
-                )
-                providers.append(f"time#{iteration}:local")
-                continue
-
-            if decision.action == "retrieve_rag":
-                query = decision.rag_query
-                if query is None:
-                    observations.append("首脑请求 RAG，但没有给出合法查询。")
-                    continue
-                rag_queries.append(query)
-                collection_label = {
-                    "algorithm_concepts": "算法概念库",
-                    "problem_bank": "题库",
-                    "code_cases": "代码案例库",
-                }.get(query.collection, query.collection)
-                await self._progress(
-                    on_progress,
-                    "rag_retrieval",
-                    f"正在检索{collection_label}",
-                    "RAG 检索 Agent",
-                    "查找与本轮题目或算法最相关的候选内容",
-                )
-                if not self.rag_retriever.availability().get(query.collection, False):
-                    limit = f"{query.collection} 当前不可用"
-                    observations.append(limit)
-                    known_limits.append(limit)
-                    rag_status = "unavailable"
-                    continue
-                try:
-                    found = await asyncio.to_thread(
-                        self.rag_retriever.retrieve,
-                        query,
-                    )
-                except Exception:
-                    limit = f"{query.collection} 检索失败"
-                    observations.append(limit)
-                    known_limits.append(limit)
-                    rag_status = "error"
-                    continue
-                added = self._merge_evidence(evidence, found, prefix="R")
-                existing_rag_count = sum(
-                    1 for item in evidence if item.collection != "web_search"
-                )
-                rag_status = "candidate_found" if existing_rag_count else "miss"
-                if added:
-                    observations.append(
-                        f"{query.collection} 检索完成，新增 {added} 条候选证据；"
-                        "首脑仍需判断其是否真正覆盖用户题面，候选不等于有效命中。"
-                    )
-                elif found and existing_rag_count:
-                    observations.append(
-                        f"{query.collection} 检索结果与已有候选重复，没有新增证据；"
-                        f"继续保留现有 {existing_rag_count} 条候选供首脑判断。"
-                    )
-                else:
-                    observations.append(
-                        f"{query.collection} 检索完成，但没有找到可用候选。"
-                    )
-                continue
-
-            if decision.action == "switch_to_native_reasoning":
-                await self._progress(
-                    on_progress,
-                    "native_reasoning",
-                    "知识库证据不足，切换自主推理",
-                    "首脑智能体",
-                    "后续由专业 Agent 基于用户题面协作解题，仍可按需联网",
-                )
-                retained_rag_count = sum(
-                    1 for item in evidence if item.collection != "web_search"
-                )
-                execution_mode = "native_reasoning"
-                if retained_rag_count:
-                    rag_status = "insufficient"
-                observations.append(
-                    "已切换到自主推理模式：不再继续依赖 RAG 扩展结论，"
-                    f"但保留 {retained_rag_count} 条候选作为低信任参考；"
-                    "执行 Agent 必须逐条核对适用范围，不能把候选冒充已确认事实。"
-                )
-                providers.append(f"mode#{iteration}:native-reasoning")
-                continue
-
-            if decision.action == "search_web":
-                query = decision.web_query or ""
-                reason = decision.web_search_reason or "补充外部信息"
-                web_queries.append(query)
-                await self._progress(
-                    on_progress,
-                    "web_search",
-                    "正在搜索可核验的外部资料",
-                    "网页搜索 Agent",
-                    reason,
-                )
-                if not self.web_search_agent.available():
-                    limit = "网页搜索 Agent 当前不可用"
-                    observations.append(limit)
-                    known_limits.append(limit)
-                    continue
-                found, web_provider = await self.web_search_agent.search(
-                    query,
-                    reason,
-                    on_retry,
-                )
-                providers.append(f"web#{iteration}:{web_provider}")
-                added = self._merge_evidence(evidence, found, prefix="W")
-                if added:
-                    observations.append(f"网页搜索完成，新增 {added} 条证据。")
-                elif "-error:" in web_provider:
-                    limit = "网页搜索请求失败，本轮未能补充外部证据。"
-                    observations.append(limit)
-                    known_limits.append(limit)
-                else:
-                    observations.append("网页搜索完成，但没有返回可用结果。")
-                continue
-
-            if decision.action == "persist_memory":
-                await self._progress(
-                    on_progress,
-                    "memory_persist",
-                    "正在更新当前会话的私有记忆",
-                    "记忆 Agent",
-                    "保存对后续轮次仍有价值的目标、偏好或约束",
-                )
-                memory_updates.extend(decision.memory_updates)
-                await self.memory_repository.upsert(
-                    user_id,
-                    session_id,
-                    decision.memory_updates,
-                    source="memory_agent",
-                )
-                durable_memory = await self.memory_repository.recall(
-                    user_id,
-                    session_id,
-                    task_spec.normalized_request,
-                )
-                observations.append(
-                    f"已写入 {len(decision.memory_updates)} 条用户私有记忆，动态系统上下文将在下一步刷新。"
-                )
-                continue
-
-            if decision.action == "ask_clarification":
-                await self._progress(
-                    on_progress,
-                    "clarification",
-                    "发现缺少会影响答案的关键信息",
-                    "澄清 Agent",
-                    "正在形成最小必要追问",
-                )
-                latest_work_result = AgentWorkResult(
-                    agent="clarification_agent",
-                    draft_answer=(
-                        decision.clarification_question
-                        or task_spec.clarifying_question
-                        or "请补充完成任务所需的信息。"
-                    ),
-                    uncertainties=known_limits,
-                    needs_follow_up=True,
-                )
-                observations.append("首脑判断必须先澄清信息，本轮停止继续执行。")
-                break
-
-            if decision.action == "delegate":
-                last_instruction = decision.task_instruction or task_spec.normalized_request
-                agent_label, activity = self._agent_activity(
-                    decision.selected_agent or "problem_solving_agent"
-                )
-                await self._progress(
-                    on_progress,
-                    "agent_work",
-                    activity,
-                    agent_label,
-                    "正在读取题面、上下文及前序 Agent 的阶段产物",
-                )
-                if execution_mode == "rag_assisted" and any(
-                    item.collection != "web_search" for item in evidence
-                ):
-                    rag_status = "hit"
-                current_plan = self._build_plan(
-                    task_spec,
-                    decisions,
-                    rag_queries,
-                    web_queries,
-                    known_limits,
-                    latest_work_result,
-                    last_instruction,
-                    execution_mode,
-                    rag_status,
-                )
-                work_request = AgentWorkRequest(
-                    task_spec=task_spec,
-                    coordinator_plan=current_plan,
-                    conversation_context=self._conversation_context_for_task(
-                        task_spec,
-                        conversation_context,
-                    ),
-                    memory=snapshot.memory,
-                    durable_memory=durable_memory,
-                    dynamic_system_prompt=dynamic_prompt,
-                    rag_evidence=evidence,
-                    prior_work_results=work_history,
-                )
-                latest_work_result, answer_provider = await self.response_agent.execute(
-                    work_request,
-                    on_retry,
-                )
-                providers.append(f"worker#{iteration}:{answer_provider}")
-                work_history.append(latest_work_result)
-                observations.append(
-                    "执行 Agent 已返回草稿；首脑必须在下一轮检查是否需要补证据、换 Agent 或结束。"
-                )
-                continue
-
-            if decision.action == "finish":
-                await self._progress(
-                    on_progress,
-                    "head_finish",
-                    "首脑已确认本轮结果可以交付",
-                    "首脑智能体",
-                    "准备进入语言润色与格式整理",
-                )
-                observations.append(decision.finish_reason or "首脑结束本轮执行。")
-                break
+                on_progress=on_progress,
+                iteration=0,
+                decisions=[],
+                evidence=evidence,
+                observations=observations,
+                rag_queries=[],
+                web_queries=[],
+                known_limits=[],
+                memory_updates=[],
+                providers=[],
+                code_execution_reports=[],
+                latest_work_result=None,
+                work_history=[],
+                execution_mode="native_reasoning" if native_only else "rag_assisted",
+                rag_status="not_checked",
+                last_instruction=task_spec.normalized_request,
+                dynamic_prompt="",
+                current_decision=None,
+            ),
+            config=graph_config,
+        )
+        decisions = graph_state["decisions"]
+        evidence = graph_state["evidence"]
+        observations = graph_state["observations"]
+        rag_queries = graph_state["rag_queries"]
+        web_queries = graph_state["web_queries"]
+        known_limits = graph_state["known_limits"]
+        memory_updates = graph_state["memory_updates"]
+        providers = graph_state["providers"]
+        code_execution_reports = graph_state["code_execution_reports"]
+        latest_work_result = graph_state["latest_work_result"]
+        work_history = graph_state["work_history"]
+        execution_mode = graph_state["execution_mode"]
+        rag_status = graph_state["rag_status"]
+        last_instruction = graph_state["last_instruction"]
 
         if latest_work_result is None:
             user_material_available = self._has_user_problem_material(task_spec)
@@ -442,6 +257,7 @@ class AdaptiveAgentRuntime:
                     dynamic_system_prompt=dynamic_prompt,
                     rag_evidence=evidence,
                     prior_work_results=work_history,
+                    code_execution_reports=code_execution_reports,
                 )
                 agent_label, activity = self._agent_activity(selected_agent)
                 await self._progress(
@@ -519,6 +335,7 @@ class AdaptiveAgentRuntime:
                 dynamic_system_prompt=dynamic_prompt,
                 rag_evidence=evidence,
                 prior_work_results=work_history,
+                code_execution_reports=code_execution_reports,
             )
             agent_label, activity = self._agent_activity(selected_agent)
             await self._progress(
@@ -536,9 +353,66 @@ class AdaptiveAgentRuntime:
             work_history.append(latest_work_result)
 
         if (
+            self._requires_code_execution(task_spec, work_history)
+            and latest_work_result.agent != "clarification_agent"
+            and self._latest_code_report(work_history, code_execution_reports) is None
+        ):
+            decisions.append(HeadDecision(
+                iteration=len(decisions) + 1,
+                rationale="决策轮次结束时发现最新代码尚未执行，启动强制真实验证收尾。",
+                action="execute_code_tests",
+            ))
+            execution_state = dict(graph_state)
+            execution_state.update({
+                "decisions": decisions,
+                "current_decision": decisions[-1],
+                "iteration": decisions[-1].iteration,
+                "latest_work_result": latest_work_result,
+                "work_history": work_history,
+                "observations": observations,
+                "known_limits": known_limits,
+                "providers": providers,
+                "code_execution_reports": code_execution_reports,
+                "on_retry": on_retry,
+                "on_progress": on_progress,
+            })
+            execution_update = await self._code_test_node(execution_state)
+            observations = execution_update.get("observations", observations)
+            known_limits = execution_update.get("known_limits", known_limits)
+            providers = execution_update.get("providers", providers)
+            code_execution_reports = execution_update.get(
+                "code_execution_reports",
+                code_execution_reports,
+            )
+
+        latest_execution_report = self._latest_code_report(
+            work_history,
+            code_execution_reports,
+        )
+        execution_tool_blocked = bool(
+            latest_execution_report
+            and latest_execution_report.overall_status in {
+                "failed",
+                "unavailable",
+                "unsupported",
+                "error",
+            }
+        )
+        if execution_tool_blocked:
+            latest_work_result = latest_work_result.model_copy(update={
+                "uncertainties": list(dict.fromkeys([
+                    *latest_work_result.uncertainties,
+                    "测试集生成或 Judge0 工具未完成，当前代码没有真实运行通过证明",
+                ])),
+                "needs_follow_up": True,
+            })
+            work_history[-1] = latest_work_result
+
+        if (
             self._requires_verification(task_spec)
             and latest_work_result.agent != "clarification_agent"
             and self._needs_verification(work_history)
+            and not execution_tool_blocked
         ):
             last_instruction = (
                 "决策轮次已结束，但最新解题或代码产物必须完成独立验证。阅读 prior_work_results，"
@@ -582,6 +456,7 @@ class AdaptiveAgentRuntime:
                 dynamic_system_prompt=dynamic_prompt,
                 rag_evidence=evidence,
                 prior_work_results=work_history,
+                code_execution_reports=code_execution_reports,
             )
             await self._progress(
                 on_progress,
@@ -615,7 +490,551 @@ class AdaptiveAgentRuntime:
             durable_memory,
             memory_updates,
             providers,
+            code_execution_reports,
         )
+
+    def _compile_graph(self):
+        workflow = StateGraph(AdaptiveRuntimeState)
+        workflow.add_node("head", self._head_node)
+        workflow.add_node("get_current_time", self._time_node)
+        workflow.add_node("retrieve_rag", self._rag_node)
+        workflow.add_node("switch_to_native_reasoning", self._native_reasoning_node)
+        workflow.add_node("search_web", self._web_search_node)
+        workflow.add_node("execute_code_tests", self._code_test_node)
+        workflow.add_node("persist_memory", self._memory_node)
+        workflow.add_node("ask_clarification", self._clarification_node)
+        workflow.add_node("delegate", self._delegate_node)
+        workflow.add_node("finish", self._finish_node)
+        workflow.add_edge(START, "head")
+        workflow.add_conditional_edges(
+            "head",
+            self._route_head_action,
+            {
+                "get_current_time": "get_current_time",
+                "retrieve_rag": "retrieve_rag",
+                "switch_to_native_reasoning": "switch_to_native_reasoning",
+                "search_web": "search_web",
+                "execute_code_tests": "execute_code_tests",
+                "persist_memory": "persist_memory",
+                "ask_clarification": "ask_clarification",
+                "delegate": "delegate",
+                "finish": "finish",
+            },
+        )
+        for node in (
+            "get_current_time",
+            "retrieve_rag",
+            "switch_to_native_reasoning",
+            "search_web",
+            "execute_code_tests",
+            "persist_memory",
+            "delegate",
+        ):
+            workflow.add_conditional_edges(
+                node,
+                self._route_after_action,
+                {"continue": "head", "end": END},
+            )
+        workflow.add_edge("ask_clarification", END)
+        workflow.add_edge("finish", END)
+        return workflow.compile(name="algomate-adaptive-agent-runtime")
+
+    async def _head_node(self, state: AdaptiveRuntimeState) -> dict:
+        iteration = state["iteration"] + 1
+        head_message, head_detail = self._head_progress(
+            state["execution_mode"],
+            state["rag_status"],
+            state["work_history"],
+        )
+        await self._progress(
+            state["on_progress"],
+            "head_decision",
+            head_message,
+            "首脑智能体",
+            head_detail,
+        )
+        dynamic_prompt = self.prompt_builder.build(
+            state["user_id"],
+            state["session_id"],
+            state["snapshot"].memory,
+            state["durable_memory"],
+            state["snapshot"].learning_profile,
+        )
+        runtime_state = self._runtime_state(
+            state["decisions"],
+            state["observations"],
+            state["evidence"],
+            state["latest_work_result"],
+            state["work_history"],
+            state["execution_mode"],
+            state["rag_status"],
+            state["code_execution_reports"],
+        )
+        runtime_state["iteration_budget"] = {
+            "current": iteration,
+            "maximum": self.max_iterations,
+            "remaining_after_this_decision": self.max_iterations - iteration,
+        }
+        decision, provider = await self.coordinator.decide(
+            task_spec=state["task_spec"],
+            snapshot=state["snapshot"],
+            runtime_state=runtime_state,
+            knowledge_availability=self.rag_retriever.availability(),
+            web_search_available=self.web_search_agent.available(),
+            dynamic_system_prompt=dynamic_prompt,
+            iteration=iteration,
+            conversation_context=self._conversation_context_for_task(
+                state["task_spec"],
+                state["conversation_context"],
+            ),
+            on_retry=state["on_retry"],
+        )
+        return {
+            "iteration": iteration,
+            "current_decision": decision,
+            "dynamic_prompt": dynamic_prompt,
+            "decisions": [*state["decisions"], decision],
+            "providers": [*state["providers"], f"head#{iteration}:{provider}"],
+        }
+
+    @staticmethod
+    def _route_head_action(state: AdaptiveRuntimeState) -> str:
+        decision = state["current_decision"]
+        if decision is None:
+            raise RuntimeError("LangGraph head node did not produce a decision")
+        return decision.action
+
+    def _route_after_action(self, state: AdaptiveRuntimeState) -> str:
+        return "end" if state["iteration"] >= self.max_iterations else "continue"
+
+    async def _time_node(self, state: AdaptiveRuntimeState) -> dict:
+        await self._progress(
+            state["on_progress"],
+            "time_tool",
+            "正在读取应用当前时间",
+            "时间工具",
+            "把相对日期转换为可检索的绝对日期",
+        )
+        time_result = self.current_time_tool.read()
+        observation = (
+            "时间工具返回："
+            f"当前日期时间 {time_result['local_datetime']}，"
+            f"日期 {time_result['chinese_date']}，"
+            f"星期 {time_result['weekday']}，"
+            f"时区 {time_result['timezone']}（UTC{time_result['utc_offset']}）。"
+            "后续涉及相对日期的检索必须使用该绝对日期。"
+        )
+        return {
+            "observations": [*state["observations"], observation],
+            "providers": [*state["providers"], f"time#{state['iteration']}:local"],
+        }
+
+    async def _rag_node(self, state: AdaptiveRuntimeState) -> dict:
+        decision = state["current_decision"]
+        query = decision.rag_query if decision is not None else None
+        if query is None:
+            return {
+                "observations": [
+                    *state["observations"],
+                    "首脑请求 RAG，但没有给出合法查询。",
+                ]
+            }
+        rag_queries = [*state["rag_queries"], query]
+        collection_label = {
+            "algorithm_concepts": "算法概念库",
+            "problem_bank": "题库",
+            "code_cases": "代码案例库",
+        }.get(query.collection, query.collection)
+        await self._progress(
+            state["on_progress"],
+            "rag_retrieval",
+            f"正在对{collection_label}执行混合检索",
+            "混合 RAG 检索 Agent",
+            "并行 Dense/BM25 召回，经 RRF 融合与 Voyage Rerank 后返回候选",
+        )
+        if not self.rag_retriever.availability().get(query.collection, False):
+            limit = f"{query.collection} 当前不可用"
+            return {
+                "rag_queries": rag_queries,
+                "observations": [*state["observations"], limit],
+                "known_limits": [*state["known_limits"], limit],
+                "rag_status": "unavailable",
+            }
+        try:
+            found = await asyncio.to_thread(self.rag_retriever.retrieve, query)
+        except Exception:
+            limit = f"{query.collection} 检索失败"
+            return {
+                "rag_queries": rag_queries,
+                "observations": [*state["observations"], limit],
+                "known_limits": [*state["known_limits"], limit],
+                "rag_status": "error",
+            }
+        evidence = list(state["evidence"])
+        added = self._merge_evidence(evidence, found, prefix="R")
+        existing_rag_count = sum(
+            1 for item in evidence if item.collection != "web_search"
+        )
+        if added:
+            retrieval_provider = next(
+                (
+                    str(item.metadata.get("retrieval_provider"))
+                    for item in found
+                    if item.metadata.get("retrieval_provider")
+                ),
+                "unknown",
+            )
+            observation = (
+                f"{query.collection} 检索完成，新增 {added} 条候选证据；"
+                f"检索链路={retrieval_provider}；"
+                "首脑仍需判断其是否真正覆盖用户题面，候选不等于有效命中。"
+            )
+        elif found and existing_rag_count:
+            observation = (
+                f"{query.collection} 检索结果与已有候选重复，没有新增证据；"
+                f"继续保留现有 {existing_rag_count} 条候选供首脑判断。"
+            )
+        else:
+            observation = f"{query.collection} 检索完成，但没有找到可用候选。"
+        return {
+            "rag_queries": rag_queries,
+            "evidence": evidence,
+            "observations": [*state["observations"], observation],
+            "rag_status": (
+                "candidate_found" if added or existing_rag_count else "miss"
+            ),
+        }
+
+    async def _native_reasoning_node(self, state: AdaptiveRuntimeState) -> dict:
+        await self._progress(
+            state["on_progress"],
+            "native_reasoning",
+            "知识库证据不足，切换自主推理",
+            "首脑智能体",
+            "后续由专业 Agent 基于用户题面协作解题，仍可按需联网",
+        )
+        retained_rag_count = sum(
+            1 for item in state["evidence"] if item.collection != "web_search"
+        )
+        return {
+            "execution_mode": "native_reasoning",
+            "rag_status": "insufficient" if retained_rag_count else state["rag_status"],
+            "observations": [
+                *state["observations"],
+                "已切换到自主推理模式：不再继续依赖 RAG 扩展结论，"
+                f"但保留 {retained_rag_count} 条候选作为低信任参考；"
+                "执行 Agent 必须逐条核对适用范围，不能把候选冒充已确认事实。",
+            ],
+            "providers": [
+                *state["providers"],
+                f"mode#{state['iteration']}:native-reasoning",
+            ],
+        }
+
+    async def _web_search_node(self, state: AdaptiveRuntimeState) -> dict:
+        decision = state["current_decision"]
+        query = (decision.web_query if decision is not None else None) or ""
+        reason = (
+            decision.web_search_reason if decision is not None else None
+        ) or "补充外部信息"
+        web_queries = [*state["web_queries"], query]
+        await self._progress(
+            state["on_progress"],
+            "web_search",
+            "正在搜索可核验的外部资料",
+            "网页搜索 Agent",
+            reason,
+        )
+        if not self.web_search_agent.available():
+            limit = "网页搜索 Agent 当前不可用"
+            return {
+                "web_queries": web_queries,
+                "observations": [*state["observations"], limit],
+                "known_limits": [*state["known_limits"], limit],
+            }
+        found, web_provider = await self.web_search_agent.search(
+            query,
+            reason,
+            state["on_retry"],
+        )
+        evidence = list(state["evidence"])
+        added = self._merge_evidence(evidence, found, prefix="W")
+        known_limits = list(state["known_limits"])
+        if added:
+            observation = f"网页搜索完成，新增 {added} 条证据。"
+        elif "-error:" in web_provider:
+            observation = "网页搜索请求失败，本轮未能补充外部证据。"
+            known_limits.append(observation)
+        else:
+            observation = "网页搜索完成，但没有返回可用结果。"
+        return {
+            "web_queries": web_queries,
+            "evidence": evidence,
+            "observations": [*state["observations"], observation],
+            "known_limits": known_limits,
+            "providers": [
+                *state["providers"],
+                f"web#{state['iteration']}:{web_provider}",
+            ],
+        }
+
+    async def _code_test_node(self, state: AdaptiveRuntimeState) -> dict:
+        await self._progress(
+            state["on_progress"],
+            "code_execution",
+            "正在生成测试并调用 Judge0 编译运行",
+            "算法测试执行 Agent",
+            "为当前代码生成边界/对抗测试 Harness，并用真实运行结果验证",
+        )
+        artifact = None
+        solution_context = ""
+        for item in reversed(state["work_history"]):
+            candidate = extract_code_artifact(item.draft_answer)
+            if candidate is not None:
+                artifact = candidate
+                solution_context = item.draft_answer
+                break
+        if artifact is None and state["task_spec"].input_artifacts.code:
+            raw_code = state["task_spec"].input_artifacts.code or ""
+            artifact = extract_code_artifact(raw_code)
+            solution_context = state["task_spec"].normalized_request
+
+        if artifact is None:
+            return {
+                "observations": [
+                    *state["observations"],
+                    "代码执行工具未找到可提取的候选代码块，无法生成 Harness。",
+                ],
+                "known_limits": [
+                    *state["known_limits"],
+                    "当前执行结果中没有可识别的完整代码",
+                ],
+            }
+
+        source_hash = hashlib.sha256(artifact.code.encode("utf-8")).hexdigest()
+        previous = next(
+            (
+                report
+                for report in reversed(state["code_execution_reports"])
+                if report.source_code_hash == source_hash
+            ),
+            None,
+        )
+        if previous is not None:
+            return {
+                "observations": [
+                    *state["observations"],
+                    f"当前代码版本已由 Judge0 执行，复用 {previous.verdict} 报告。",
+                ]
+            }
+
+        language = normalize_language(
+            artifact.programming_language
+            or state["task_spec"].input_artifacts.programming_language
+            or ""
+        ) or "Unknown"
+        if language not in {"Python", "Java", "C++"}:
+            report = CodeExecutionReport(
+                source_code_hash=source_hash,
+                language=language,
+                overall_status="unsupported",
+                verdict="Unsupported Language",
+                failure_reason="目前真实执行仅支持 Python、Java 和 C++。",
+            )
+            return {
+                "code_execution_reports": [*state["code_execution_reports"], report],
+                "observations": [
+                    *state["observations"],
+                    f"Judge0 尚未接入 {language} 的 Harness 生成协议。",
+                ],
+                "providers": [
+                    *state["providers"],
+                    f"judge0#{state['iteration']}:unsupported",
+                ],
+            }
+
+        try:
+            if self.code_test_generation_agent is None:
+                raise RuntimeError("算法测试生成 Agent 未配置")
+            plan, generation_provider = await self.code_test_generation_agent.generate(
+                task_spec=state["task_spec"],
+                candidate_code=artifact.code,
+                language=language,
+                solution_context=solution_context,
+                on_retry=state["on_retry"],
+            )
+            report = await self.judge0_code_runner.run(plan)
+            providers = [
+                *state["providers"],
+                f"test-generator#{state['iteration']}:{generation_provider}",
+                f"judge0#{state['iteration']}:judge0-sdk",
+            ]
+        except Exception as error:
+            report = CodeExecutionReport(
+                source_code_hash=source_hash,
+                language=language,
+                overall_status="error",
+                verdict="Test Generation Error",
+                failure_reason=f"{type(error).__name__}: {error}"[:2_000],
+            )
+            providers = [
+                *state["providers"],
+                f"judge0#{state['iteration']}:test-generation-error",
+            ]
+
+        if report.overall_status == "passed":
+            observation = (
+                f"Judge0 对源码 {source_hash[:12]}… 的真实执行通过："
+                f"{report.passed_tests}/{report.total_tests}，verdict={report.verdict}。"
+            )
+        else:
+            observation = (
+                f"Judge0 对源码 {source_hash[:12]}… 的执行未通过："
+                f"status={report.overall_status}，verdict={report.verdict}，"
+                f"原因={report.failure_reason or '未提供'}。"
+            )
+        return {
+            "code_execution_reports": [*state["code_execution_reports"], report],
+            "observations": [*state["observations"], observation],
+            "providers": providers,
+        }
+
+    async def _memory_node(self, state: AdaptiveRuntimeState) -> dict:
+        decision = state["current_decision"]
+        updates = decision.memory_updates if decision is not None else []
+        await self._progress(
+            state["on_progress"],
+            "memory_persist",
+            "正在更新当前会话的私有记忆",
+            "记忆 Agent",
+            "保存对后续轮次仍有价值的目标、偏好或约束",
+        )
+        await self.memory_repository.upsert(
+            state["user_id"],
+            state["session_id"],
+            updates,
+            source="memory_agent",
+        )
+        durable_memory = await self.memory_repository.recall(
+            state["user_id"],
+            state["session_id"],
+            state["task_spec"].normalized_request,
+        )
+        return {
+            "durable_memory": durable_memory,
+            "memory_updates": [*state["memory_updates"], *updates],
+            "observations": [
+                *state["observations"],
+                f"已写入 {len(updates)} 条用户私有记忆，动态系统上下文将在下一步刷新。",
+            ],
+        }
+
+    async def _clarification_node(self, state: AdaptiveRuntimeState) -> dict:
+        decision = state["current_decision"]
+        await self._progress(
+            state["on_progress"],
+            "clarification",
+            "发现缺少会影响答案的关键信息",
+            "澄清 Agent",
+            "正在形成最小必要追问",
+        )
+        result = AgentWorkResult(
+            agent="clarification_agent",
+            draft_answer=(
+                (decision.clarification_question if decision is not None else None)
+                or state["task_spec"].clarifying_question
+                or "请补充完成任务所需的信息。"
+            ),
+            uncertainties=state["known_limits"],
+            needs_follow_up=True,
+        )
+        return {
+            "latest_work_result": result,
+            "observations": [
+                *state["observations"],
+                "首脑判断必须先澄清信息，本轮停止继续执行。",
+            ],
+        }
+
+    async def _delegate_node(self, state: AdaptiveRuntimeState) -> dict:
+        decision = state["current_decision"]
+        if decision is None:
+            raise RuntimeError("LangGraph delegate node has no head decision")
+        last_instruction = decision.task_instruction or state["task_spec"].normalized_request
+        selected_agent = decision.selected_agent or "problem_solving_agent"
+        agent_label, activity = self._agent_activity(selected_agent)
+        await self._progress(
+            state["on_progress"],
+            "agent_work",
+            activity,
+            agent_label,
+            "正在读取题面、上下文及前序 Agent 的阶段产物",
+        )
+        rag_status = state["rag_status"]
+        if state["execution_mode"] == "rag_assisted" and any(
+            item.collection != "web_search" for item in state["evidence"]
+        ):
+            rag_status = "hit"
+        current_plan = self._build_plan(
+            state["task_spec"],
+            state["decisions"],
+            state["rag_queries"],
+            state["web_queries"],
+            state["known_limits"],
+            state["latest_work_result"],
+            last_instruction,
+            state["execution_mode"],
+            rag_status,
+        )
+        work_request = AgentWorkRequest(
+            task_spec=state["task_spec"],
+            coordinator_plan=current_plan,
+            conversation_context=self._conversation_context_for_task(
+                state["task_spec"],
+                state["conversation_context"],
+            ),
+            memory=state["snapshot"].memory,
+            durable_memory=state["durable_memory"],
+            dynamic_system_prompt=state["dynamic_prompt"],
+            rag_evidence=state["evidence"],
+            prior_work_results=state["work_history"],
+            code_execution_reports=state["code_execution_reports"],
+        )
+        result, answer_provider = await self.response_agent.execute(
+            work_request,
+            state["on_retry"],
+        )
+        return {
+            "last_instruction": last_instruction,
+            "latest_work_result": result,
+            "work_history": [*state["work_history"], result],
+            "rag_status": rag_status,
+            "providers": [
+                *state["providers"],
+                f"worker#{state['iteration']}:{answer_provider}",
+            ],
+            "observations": [
+                *state["observations"],
+                "执行 Agent 已返回草稿；首脑必须在下一轮检查是否需要补证据、换 Agent 或结束。",
+            ],
+        }
+
+    async def _finish_node(self, state: AdaptiveRuntimeState) -> dict:
+        decision = state["current_decision"]
+        await self._progress(
+            state["on_progress"],
+            "head_finish",
+            "首脑已确认本轮结果可以交付",
+            "首脑智能体",
+            "准备进入语言润色与格式整理",
+        )
+        return {
+            "observations": [
+                *state["observations"],
+                (decision.finish_reason if decision is not None else None)
+                or "首脑结束本轮执行。",
+            ]
+        }
 
     def _build_plan(
         self,
@@ -704,7 +1123,18 @@ class AdaptiveAgentRuntime:
         work_history: list[AgentWorkResult],
         execution_mode: str,
         rag_status: str,
+        code_execution_reports: list[CodeExecutionReport],
     ) -> dict:
+        latest_code_hash = None
+        latest_code_language = None
+        for item in reversed(work_history):
+            artifact = extract_code_artifact(item.draft_answer)
+            if artifact is not None:
+                latest_code_hash = hashlib.sha256(
+                    artifact.code.encode("utf-8")
+                ).hexdigest()
+                latest_code_language = artifact.programming_language
+                break
         return {
             "execution_mode": execution_mode,
             "rag_status": rag_status,
@@ -770,6 +1200,15 @@ class AdaptiveAgentRuntime:
                 }
                 for item in work_history[-5:]
             ],
+            "code_execution_reports": [
+                item.model_dump(exclude={"stdout", "stderr", "compile_output"})
+                for item in code_execution_reports[-3:]
+            ],
+            "latest_code": {
+                "detected": latest_code_hash is not None,
+                "source_code_hash": latest_code_hash,
+                "language": latest_code_language,
+            },
         }
 
     @staticmethod
@@ -812,6 +1251,42 @@ class AdaptiveAgentRuntime:
     @staticmethod
     def _requires_verification(task_spec: TaskSpec) -> bool:
         return CoordinatorAgent._requires_verification(task_spec)
+
+    @staticmethod
+    def _requires_code_execution(
+        task_spec: TaskSpec,
+        work_history: list[AgentWorkResult],
+    ) -> bool:
+        if task_spec.primary_intent not in {
+            "problem_solving",
+            "code_generation",
+            "code_diagnosis",
+        }:
+            return False
+        return any(
+            extract_code_artifact(item.draft_answer) is not None
+            for item in work_history
+        )
+
+    @staticmethod
+    def _latest_code_report(
+        work_history: list[AgentWorkResult],
+        reports: list[CodeExecutionReport],
+    ) -> CodeExecutionReport | None:
+        for item in reversed(work_history):
+            artifact = extract_code_artifact(item.draft_answer)
+            if artifact is None:
+                continue
+            source_hash = hashlib.sha256(artifact.code.encode("utf-8")).hexdigest()
+            return next(
+                (
+                    report
+                    for report in reversed(reports)
+                    if report.source_code_hash == source_hash
+                ),
+                None,
+            )
+        return None
 
     @staticmethod
     def _conversation_context_for_task(

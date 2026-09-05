@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app.main import app, model_config_store, orchestrator
+from app.config import Settings
 from app.core.intent_recognizer import IntentRecognizer
 from app.core.model_config_store import ModelConfigStatus, RuntimeModelConfig
 from app.models import (
@@ -19,6 +20,51 @@ from app.models import (
 
 
 client = TestClient(app)
+
+
+def test_complete_agent_pipeline_is_compiled_as_nested_langgraphs() -> None:
+    top_level_nodes = set(orchestrator.graph.get_graph().nodes)
+    runtime_nodes = set(orchestrator.adaptive_runtime.graph.get_graph().nodes)
+
+    assert {
+        "session_scope",
+        "input_organization",
+        "context_prepare",
+        "input_rewrite",
+        "intent_recognition",
+        "context_finalize",
+        "learning_profile",
+        "memory_observation",
+        "agent_runtime",
+        "polishing",
+        "formatting",
+        "response_assembly",
+    } <= top_level_nodes
+    assert {
+        "head",
+        "get_current_time",
+        "retrieve_rag",
+        "switch_to_native_reasoning",
+        "search_web",
+        "persist_memory",
+        "ask_clarification",
+        "delegate",
+        "finish",
+    } <= runtime_nodes
+
+
+def test_langsmith_key_supports_existing_x_api_key_name() -> None:
+    configured = Settings(
+        _env_file=None,
+        **{
+            "X-API-Key": "test-langsmith-key",
+            "LANGSMITH_PROJECT": "test-algomate-project",
+        },
+    )
+
+    assert configured.langsmith_api_key is not None
+    assert configured.langsmith_api_key.get_secret_value() == "test-langsmith-key"
+    assert configured.langsmith_project == "test-algomate-project"
 
 
 def stub_downstream_agents(monkeypatch) -> None:

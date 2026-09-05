@@ -10,6 +10,7 @@ SYSTEM_PROMPT = """你是 AlgoMate 多智能体系统的首脑智能体。你不
 - retrieve_rag：检索算法概念库、题库或代码案例库。
 - switch_to_native_reasoning：RAG 未命中、内容不相关、证据不足或不可用时，切换为不依赖 RAG 的自主推理模式。
 - search_web：知识库不足、问题具有时效性、需要外部文档或实施细节时，调用网页搜索 Agent。
+- execute_code_tests：对执行 Agent 最新生成的 Python/Java/C++ 代码生成测试 Harness，并调用 Judge0 真实编译运行。
 - delegate：选择一个专业执行 Agent 分析并产生或修订回答草稿。
 - persist_memory：把对未来对话重要且用户明确表达的信息写入用户私有记忆。
 - ask_clarification：缺失信息会实质改变答案时提出最小必要追问。
@@ -18,7 +19,7 @@ SYSTEM_PROMPT = """你是 AlgoMate 多智能体系统的首脑智能体。你不
 专业 Agent：tutoring_agent, problem_solving_agent, code_analysis_agent,
 problem_structuring_agent, strategy_agent, solution_review_agent,
 implementation_agent, verification_agent, learning_planning_agent,
-conversation_agent, clarification_agent。
+conversation_agent, clarification_agent, code_test_generation_agent。
 
 通用决策原则：
 1. 不按固定步骤行动。每次根据 runtime_state 决定最有价值的下一步。
@@ -101,13 +102,22 @@ conversation_agent, clarification_agent。
     作者、场次和标题等线索，摘要没有算法正文时不能声称采用了视频中的具体解法。
 44. 为一组公开题目生成代码时，每道代码必须能对应一条已核验题面；先 delegate 给 implementation_agent 逐题实现，再由
     verification_agent 核对函数签名、样例、边界、复杂度和题目对应关系。不得因为上一轮已经给过解析就跳过本轮核验。
+45. 当 runtime_state.latest_code.detected=true，必须检查是否有 source_code_hash 完全一致的 code_execution_reports。
+    没有时，下一步必须 execute_code_tests，不能直接 verification 或 finish。源码哈希变化代表代码已修改，必须重新执行。
+46. Judge0 报告为 passed 后，再 delegate 给 verification_agent 综合题面、代码和真实报告形成最终交付；verification_agent
+    不得把测试通过扩大为形式化正确性证明。报告为 failed 时，必须把编译/运行/反例信息交给 implementation_agent 或
+    code_analysis_agent 修复，修复后再次 execute_code_tests，禁止直接 finish。
+47. Judge0 为 unavailable/error/unsupported 时，可以委托 verification_agent 做静态降级审查，但必须在最终结果中明确写明
+    真实执行工具不可用及未验证边界，不得声称运行通过。测试 Harness 由测试生成 Agent 创建，但最终裁决只采信 Judge0 报告。
+48. 用户明确要求“不走 RAG、不联网、直接自主解题、仅使用算法 Agent”时，将其视为本轮工具约束：禁止 retrieve_rag 和
+    search_web，直接在 native_reasoning 下委托算法专业 Agent。该约束只影响当前任务，不得写成长期偏好或绕过代码执行验证。
 
 只返回 JSON：
 {
   "schema_version": "1.0",
   "iteration": 1,
   "rationale": "为什么当前状态下选择这个动作",
-  "action": "get_current_time | retrieve_rag | switch_to_native_reasoning | search_web | delegate | persist_memory | ask_clarification | finish",
+  "action": "get_current_time | retrieve_rag | switch_to_native_reasoning | search_web | execute_code_tests | delegate | persist_memory | ask_clarification | finish",
   "selected_agent": null,
   "task_instruction": null,
   "rag_query": null,
@@ -121,6 +131,7 @@ conversation_agent, clarification_agent。
 retrieve_rag 时 rag_query 必须符合：
 {"collection":"algorithm_concepts|problem_bank|code_cases","query":"精炼查询","reason":"调用原因","top_k":1到3,"required":false}。
 switch_to_native_reasoning 不需要额外字段。search_web 必须填写 web_query 和 web_search_reason。
+execute_code_tests 不需要额外字段，但只能在已有执行 Agent 代码且该源码版本尚无执行报告时选择。
 delegate 必须填写 selected_agent 和 task_instruction。
 persist_memory 必须填写 memory_updates。ask_clarification 必须填写 clarification_question。
 finish 必须填写 finish_reason，且 runtime_state 中必须已有 latest_work_result。"""
@@ -163,6 +174,9 @@ class CoordinatorAgent:
             "available_tools": [{
                 "name": "get_current_time",
                 "description": "读取应用所在时区的当前日期、时间和星期。",
+            }, {
+                "name": "execute_code_tests",
+                "description": "为最新 Python/Java/C++ 候选代码生成 Harness，并调用 Judge0 真实编译运行。",
             }],
             "runtime_state": runtime_state,
             "current_iteration": iteration,
@@ -243,6 +257,17 @@ class CoordinatorAgent:
         rag_status = runtime_state.get("rag_status", "not_checked")
         latest = runtime_state.get("latest_work_result")
         work_history = runtime_state.get("work_history", [])
+        latest_code = runtime_state.get("latest_code") or {}
+        latest_code_hash = latest_code.get("source_code_hash")
+        execution_reports = runtime_state.get("code_execution_reports", [])
+        latest_execution = next(
+            (
+                item
+                for item in reversed(execution_reports)
+                if item.get("source_code_hash") == latest_code_hash
+            ),
+            None,
+        )
 
         if cls._requires_initial_rag(task_spec) and not rag_checked:
             collection = (
@@ -273,6 +298,23 @@ class CoordinatorAgent:
             )
 
         if latest is not None:
+            if latest_code_hash and latest_execution is None:
+                return HeadDecision(
+                    iteration=iteration,
+                    rationale="最新代码版本尚无真实执行报告，调用 Judge0 验证",
+                    action="execute_code_tests",
+                )
+            if latest_execution and latest_execution.get("overall_status") == "failed":
+                return HeadDecision(
+                    iteration=iteration,
+                    rationale="Judge0 已发现最新代码失败，转交实现 Agent 根据报告修复",
+                    action="delegate",
+                    selected_agent="implementation_agent",
+                    task_instruction=(
+                        "阅读 code_execution_reports 中与最新源码哈希匹配的失败报告，定位编译、"
+                        "运行或反例错误；修复代码并返回完整答案。不得声称修复后已通过，后续将重新运行。"
+                    ),
+                )
             completed_agents = [item.get("agent") for item in work_history]
             solution_agents = {
                 "problem_solving_agent",
@@ -393,12 +435,25 @@ class CoordinatorAgent:
         )
         execution_mode = runtime_state.get("execution_mode", "rag_assisted")
         rag_status = runtime_state.get("rag_status", "not_checked")
+        native_only = CoordinatorAgent._requests_native_only(task_spec)
+        latest_code = runtime_state.get("latest_code") or {}
+        latest_code_hash = latest_code.get("source_code_hash")
+        latest_execution = next(
+            (
+                item
+                for item in reversed(runtime_state.get("code_execution_reports", []))
+                if item.get("source_code_hash") == latest_code_hash
+            ),
+            None,
+        )
         if (
             CoordinatorAgent._requires_initial_rag(task_spec)
             and not rag_already_checked
             and decision.action not in {"get_current_time", "retrieve_rag"}
         ):
             raise ValueError("包含用户题面或代码的算法任务必须先检索 RAG，再决定使用证据或切换自主推理")
+        if native_only and decision.action in {"retrieve_rag", "search_web"}:
+            raise ValueError("用户已明确要求本轮不使用 RAG 或网页检索，必须直接调用算法解题模块")
         if decision.action == "get_current_time":
             if time_already_read:
                 raise ValueError("当前时间已经读取，不得重复调用时间工具")
@@ -444,6 +499,11 @@ class CoordinatorAgent:
             raise ValueError("search_web 缺少查询或搜索原因")
         if decision.action == "search_web" and not web_search_available:
             raise ValueError("网页搜索工具当前不可用，请使用已有证据、其他能力或重新规划")
+        if decision.action == "execute_code_tests":
+            if not latest_code_hash:
+                raise ValueError("尚无可执行的候选代码，不能调用 Judge0")
+            if latest_execution is not None:
+                raise ValueError("当前源码版本已有执行报告，不得重复消耗 Judge0 额度")
         if decision.action == "search_web":
             query = " ".join((decision.web_query or "").casefold().split())
             previous_web_searches = [
@@ -463,6 +523,20 @@ class CoordinatorAgent:
             decision.selected_agent is None or not decision.task_instruction
         ):
             raise ValueError("delegate 缺少执行 Agent 或任务说明")
+        if latest_code_hash and latest_execution is None and decision.action != "execute_code_tests":
+            raise ValueError("最新代码尚未真实执行，必须先调用 execute_code_tests")
+        if (
+            latest_execution
+            and latest_execution.get("overall_status") == "failed"
+            and (
+                decision.action == "finish"
+                or (
+                    decision.action == "delegate"
+                    and decision.selected_agent == "verification_agent"
+                )
+            )
+        ):
+            raise ValueError("Judge0 已报告失败，必须先由实现或代码分析 Agent 修复并重新执行")
         if (
             decision.action in {"delegate", "finish"}
             and CoordinatorAgent._needs_solution_reference_search(
@@ -485,6 +559,8 @@ class CoordinatorAgent:
                 raise ValueError("尚无执行 Agent 结果，不能 finish")
             if runtime_state.get("latest_work_result", {}).get("needs_follow_up"):
                 raise ValueError("最新执行结果仍要求后续处理，不能直接 finish")
+            if latest_code_hash and latest_execution is None:
+                raise ValueError("交付代码没有匹配源码哈希的 Judge0 执行报告")
             if CoordinatorAgent._requires_verification(task_spec):
                 work_history = runtime_state.get("work_history", [])
                 completed_agents = [item.get("agent") for item in work_history]
@@ -539,6 +615,8 @@ class CoordinatorAgent:
 
     @staticmethod
     def _requires_initial_rag(task_spec: TaskSpec) -> bool:
+        if CoordinatorAgent._requests_native_only(task_spec):
+            return False
         if task_spec.primary_intent not in {
             "guided_hint",
             "problem_solving",
@@ -554,6 +632,29 @@ class CoordinatorAgent:
             or (artifacts.code or "").strip()
             or artifacts.test_cases
         )
+
+    @staticmethod
+    def _requests_native_only(task_spec: TaskSpec) -> bool:
+        text = " ".join([
+            task_spec.normalized_request,
+            task_spec.user_goal,
+            *task_spec.constraints,
+        ]).casefold()
+        markers = (
+            "不走rag",
+            "不走 rag",
+            "不用rag",
+            "不用 rag",
+            "不要rag",
+            "不要 rag",
+            "不使用知识库",
+            "跳过知识库",
+            "不联网",
+            "不要联网",
+            "native reasoning only",
+            "no rag",
+        )
+        return any(marker in text for marker in markers)
 
     @staticmethod
     def _requires_verification(task_spec: TaskSpec) -> bool:

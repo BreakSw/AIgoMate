@@ -1,12 +1,14 @@
 # AlgoMate · 智能算法学习平台
 
-AlgoMate 是一个基于 **Vue 3 + Spring Boot + FastAPI** 的多智能体算法学习平台。它将对话理解、动态任务规划、会话记忆、上下文压缩、RAG 检索、网页搜索与流式输出组合成一条可观测的学习链路，面向算法概念讲解、题目推荐、代码分析和学习规划等场景。
+AlgoMate 是一个基于 **Vue 3 + Spring Boot + FastAPI + LangGraph** 的多智能体算法学习平台。它将对话理解、动态任务规划、会话记忆、上下文压缩、RAG 检索、网页搜索与流式输出组合成一条可观测的学习链路，面向算法概念讲解、题目推荐、代码分析和学习规划等场景。
 
-> 当前仓库是可运行的工程版本：前后端、SQLite 会话持久化、多 Agent 编排、Milvus RAG、SerpAPI 搜索、上下文与私有记忆管理均已接通。代码执行沙箱、完整账号体系和生产部署仍在规划中。
+> 当前仓库是可运行的工程版本：前后端、SQLite 会话持久化、多 Agent 编排、Milvus RAG、SerpAPI 搜索、上下文与私有记忆管理以及 Judge0 多语言代码执行均已接通。完整账号体系和生产部署仍在规划中。
 
 ## 核心能力
 
-- **多 Agent 动态编排**：首脑 Agent 根据每轮最新状态自主选择时间工具、RAG、网页搜索、专业执行 Agent、记忆写入、澄清或结束，不依赖固定流水线。
+- **分层 LangGraph 编排**：顶层图管理输入、上下文、意图、画像、记忆、回答与格式化的完整生命周期；内部子图由首脑 Agent 根据最新状态动态选择时间工具、RAG、网页搜索、专业执行 Agent、记忆写入、澄清或结束。
+- **LangSmith 可观测性**：完整请求图与内部决策子图共享同一条父子 Trace，可查看节点输入输出、调用顺序、耗时和异常。
+- **真实代码验证闭环**：测试生成 Agent 为候选 Python/Java/C++ 代码构造样例、边界、对抗和小规模 Oracle Harness；独立 Reflection Critic 审查候选调用、Oracle 正确性、约束与覆盖并触发修订，Judge0 再负责真实编译运行。源码 SHA-256 将报告绑定到代码版本，失败后由实现 Agent 修复并重新执行。
 - **结构化意图识别**：输入整理、指代改写和 TaskSpec 识别分层执行，为后续 Agent 提供目标、约束、交付格式和所需能力。
 - **上下文预算与压缩**：默认使用 32K 上下文窗口，保留输出预算；只有活跃上下文超过安全阈值时才创建统一压缩检查点。
 - **会话级私有记忆**：偏好、目标、约束、学习事实和未完成任务按照 `user_id + session_id` 隔离存储，避免不同对话串线。
@@ -24,15 +26,17 @@ flowchart LR
     U[用户] --> V[Vue 3 学习工作台<br/>:5173]
     V -->|REST / SSE| B[Spring Boot 业务服务<br/>:8898]
     B --> S[(SQLite<br/>用户 / 会话 / 消息)]
-    B --> A[FastAPI Agent Service<br/>:8000]
+    B --> A[FastAPI + LangGraph Agent Service<br/>:8000]
     A --> KV[(Redis<br/>加密模型与搜索配置 / TTL)]
 
-    A --> I[输入整理与意图识别]
+    A --> LS[LangSmith Trace]
+    A --> I[顶层请求工作流]
     I --> C[首脑 Agent]
     C --> T[时间工具]
     C --> W[SerpAPI 网页搜索]
     C --> R[Milvus RAG]
     C --> E[专业执行 Agent]
+    C --> J[测试生成 Agent + Judge0]
     C --> M[会话私有记忆]
     E --> P[语言润色与格式 Agent]
     P --> B
@@ -42,15 +46,22 @@ flowchart LR
     R --> R3[代码案例库]
 ```
 
-### 单轮 Agent 链路
+### 分层 LangGraph 链路
 
 ```text
-输入整理 → 指代与约束改写 → TaskSpec 意图识别 → 记忆观察
-                                              ↓
-                                   首脑 Agent 动态决策循环
-                             ↙ RAG / 搜索 / 工具 / 专业 Agent ↘
-                                              ↓
-                                    润色 → 格式整理 → SSE
+顶层图：会话隔离 → 输入整理 → 上下文准备 → 输入改写 → 意图识别
+          → 上下文提交 → 学习画像 → 记忆观察 → Agent Runtime 子图
+          → 润色 → 格式整理 → 响应装配
+
+内部子图：首脑决策
+          ├─ 当前时间 ───────────────┐
+          ├─ RAG 检索 ──────────────┤
+          ├─ 网页搜索 ──────────────┤
+          ├─ Judge0 代码执行 ───────┤
+          ├─ 私有记忆写入 ──────────┤→ 返回首脑继续决策
+          ├─ 专业 Agent 委派 ───────┘
+          ├─ 澄清 → END
+          └─ 完成 → END
 ```
 
 首脑 Agent 会在每次工具或专业 Agent 返回后重新读取运行状态。若精确目标受限于外部数据或证据不足，它会明确说明差异，并根据当前会话目标、记忆和已有资料规划最接近的可用结果。
@@ -64,7 +75,9 @@ flowchart LR
 | 代码案例库 | 与题目配对的高质量解析和代码 | `voyage-code-4` | 106 | 175 |
 | 用户私有记忆 | 目标、偏好、约束和学习轨迹 | 当前为会话级文本召回 | 动态增长 | — |
 
-检索时，首脑 Agent 先产生文字查询，Agent Service 使用与文档一致的 Voyage 模型生成查询向量，再通过 Milvus 进行余弦相似度检索；若向量服务或集合不可用，会安全退回本地文字匹配。
+检索仍由 LangGraph 内部子图的首脑 Agent 动态触发。RAG 节点对首脑指定的单个知识库并行执行两路召回：Voyage Query Embedding + Milvus COSINE 稠密检索负责语义匹配，内存 BM25 倒排索引负责题号、算法名、函数名和关键字精确匹配；两路各取 Top-20 文档，通过 RRF 合并为 Top-20 候选，再由 `rerank-2.5` 精排并返回首脑要求的 Top-K。每条证据保存 Dense、BM25、RRF 与 Rerank 排名/分数，能够在 LangSmith 的 Graph State 中审查。单个阶段不可用时会降级到剩余召回路径，Milvus 整体不可用时才退回本地文字匹配。
+
+BM25 索引直接基于 Milvus 中已导入的分块正文按库懒加载构建，并在导入报告变化时自动失效，因此升级混合检索不需要重新消耗 Embedding 配额。
 
 抓取正文、清洗语料和本地向量文件不进入 Git，避免提交第三方网页内容与可再生大文件。仓库保留可复现的数据流水线、数据说明和人工编写的评测用例，详情见 [RAG 数据说明](rag-data/README.md)。
 
@@ -86,6 +99,9 @@ flowchart LR
 | 硬限制 | 28,672 tokens |
 | 输出预留 | 8,192 tokens |
 | 模型断连重试上限 | 5 次 |
+| Dense / BM25 候选 | 各 20 条文档 |
+| RRF 平滑常数 | 60 |
+| Rerank 候选 | 20 条文档 |
 
 ## 技术栈
 
@@ -93,10 +109,10 @@ flowchart LR
 | --- | --- |
 | 前端 | Vue 3、TypeScript、Vite |
 | 业务后端 | Java 21、Spring Boot 3.4、Spring Data JPA、SSE |
-| Agent 服务 | Python、FastAPI、Pydantic、异步 HTTP |
+| Agent 服务 | Python、FastAPI、LangGraph、Pydantic、Judge0 SDK、异步 HTTP |
 | 数据存储 | SQLite、Redis、Milvus Lite |
-| 模型与检索 | DeepSeek、Voyage Embedding/Rerank、SerpAPI |
-| 测试 | Pytest、Spring Boot Test、Vue Type Check、Vite Build |
+| 模型与检索 | DeepSeek、Voyage Embedding/Rerank、SerpAPI、LangSmith Trace |
+| 测试 | Judge0、Pytest、Spring Boot Test、Vue Type Check、Vite Build |
 
 ## 目录结构
 
@@ -206,9 +222,13 @@ Copy-Item agent-service/.env.example .env
 REDIS_URL=redis://127.0.0.1:6379/0
 REDIS_PASSWORD=your_redis_password
 MODEL_CONFIG_ENCRYPTION_KEY=your_random_encryption_secret
+LANGSMITH_API_KEY=your_langsmith_api_key
+LANGSMITH_PROJECT=algomate-langgraph
 ```
 
 `.env` 已被 Git 忽略，请勿提交真实密钥。Agent Service 不再从 `.env` 读取大模型或 SerpAPI Key；Redis 可用后，在前端“模型设置”页面填写模型连接和搜索凭据。若需要限制公网用户可填写的模型地址，可设置逗号分隔的 `MODEL_BASE_URL_ALLOWED_HOSTS=api.deepseek.com,api.openai.com`。
+
+`LANGSMITH_API_KEY` 仅用于 Agent 工作流观测；为兼容现有本地配置，也支持变量名 `X-API-Key`。启用后在 LangSmith 的 `algomate-langgraph` Project 中可查看顶层请求图和内部首脑子图。Trace 会包含用户输入、节点状态和模型输出，生产部署前应根据隐私要求设置脱敏与数据保留策略。
 
 本地运行 Agent Service 前，需要确保 Redis 7+ 已启动且 `REDIS_URL`、`REDIS_PASSWORD` 与实际服务一致；Redis 不可用时，模型配置页面和 Agent 模型调用会明确返回不可用状态。
 
@@ -329,7 +349,7 @@ npm run build
 
 ## 后续计划
 
-- 增加代码执行沙箱与多语言判题能力。
+- 将当前 Judge0 公共客户端替换为自托管或带配额的生产实例，并扩展更多语言 Harness。
 - 扩充人工相关性标注，建立稳定的 RAG 回归基准。
 - 引入可配置的 Rerank 与置信度阈值，完善库外问题拒答。
 - 增加账号、课程、学习进度和生产级部署方案。

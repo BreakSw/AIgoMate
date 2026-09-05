@@ -368,6 +368,7 @@ ExecutionAgent = Literal[
     "solution_review_agent",
     "implementation_agent",
     "verification_agent",
+    "code_test_generation_agent",
     "learning_planning_agent",
     "conversation_agent",
     "clarification_agent",
@@ -433,6 +434,7 @@ class HeadDecision(BaseModel):
         "retrieve_rag",
         "switch_to_native_reasoning",
         "search_web",
+        "execute_code_tests",
         "delegate",
         "persist_memory",
         "ask_clarification",
@@ -494,6 +496,7 @@ class AgentWorkRequest(BaseModel):
     dynamic_system_prompt: str = ""
     rag_evidence: list[RagEvidence] = Field(default_factory=list)
     prior_work_results: list["AgentWorkResult"] = Field(default_factory=list)
+    code_execution_reports: list["CodeExecutionReport"] = Field(default_factory=list)
 
 
 class AgentWorkResult(BaseModel):
@@ -503,6 +506,77 @@ class AgentWorkResult(BaseModel):
     used_evidence_ids: list[str] = Field(default_factory=list)
     uncertainties: list[str] = Field(default_factory=list)
     needs_follow_up: bool = False
+
+
+CodeExecutionStatus = Literal[
+    "passed",
+    "failed",
+    "unavailable",
+    "unsupported",
+    "error",
+]
+
+
+class CodeTestPlan(BaseModel):
+    """Executable harness produced for one exact candidate-code revision."""
+
+    protocol_version: Literal["1.0"] = "1.0"
+    language: Literal["Python", "Java", "C++"]
+    source_code_hash: str = Field(min_length=64, max_length=64)
+    executable_source: str = Field(min_length=20)
+    expected_output: str = Field(min_length=1)
+    test_count: int = Field(ge=1, le=100)
+    test_categories: list[str] = Field(default_factory=list)
+    oracle_strategy: str = Field(min_length=1, max_length=500)
+    semantic_reflection_rounds: int = Field(default=0, ge=0, le=5)
+    review_summary: str | None = Field(default=None, max_length=1_000)
+    review_confidence: float | None = Field(default=None, ge=0, le=1)
+
+
+class CodeTestPlanReview(BaseModel):
+    """Independent semantic critique of a generated algorithm test Harness."""
+
+    protocol_version: Literal["1.0"] = "1.0"
+    verdict: Literal["approved", "revise"]
+    summary: str = Field(min_length=1, max_length=1_000)
+    checked_dimensions: list[Literal[
+        "candidate_integrity",
+        "candidate_invocation",
+        "oracle_independence",
+        "oracle_correctness",
+        "constraint_compliance",
+        "edge_coverage",
+        "language_compilability",
+        "output_protocol",
+    ]] = Field(default_factory=list)
+    issues: list[str | dict[str, Any]] = Field(default_factory=list)
+    revision_instructions: list[str | dict[str, Any]] = Field(default_factory=list)
+    confidence: float = Field(ge=0, le=1)
+
+
+class CodeExecutionReport(BaseModel):
+    """Normalized, user-visible report returned by the Judge0 tool boundary."""
+
+    protocol_version: Literal["1.0"] = "1.0"
+    provider: Literal["judge0-sdk"] = "judge0-sdk"
+    source_code_hash: str = Field(min_length=64, max_length=64)
+    language: str
+    overall_status: CodeExecutionStatus
+    verdict: str
+    passed_tests: int = Field(default=0, ge=0)
+    total_tests: int = Field(default=0, ge=0)
+    test_categories: list[str] = Field(default_factory=list)
+    oracle_strategy: str = ""
+    semantic_reflection_rounds: int = Field(default=0, ge=0, le=5)
+    test_plan_review: str | None = None
+    test_plan_review_confidence: float | None = Field(default=None, ge=0, le=1)
+    stdout: str | None = None
+    stderr: str | None = None
+    compile_output: str | None = None
+    exit_code: int | None = None
+    time_seconds: float | None = None
+    memory_kb: int | None = None
+    failure_reason: str | None = None
 
 
 class PolishResult(BaseModel):
@@ -531,3 +605,4 @@ class AgentExecutionTrace(BaseModel):
     durable_memory: list[DurableMemoryItem] = Field(default_factory=list)
     memory_updates: list[MemoryUpdate] = Field(default_factory=list)
     model_call_trace: list[str] = Field(default_factory=list)
+    code_execution_reports: list[CodeExecutionReport] = Field(default_factory=list)

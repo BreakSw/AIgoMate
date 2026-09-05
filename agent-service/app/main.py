@@ -3,14 +3,18 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, Response, status
+from langchain_core.tracers import LangChainTracer
+from langsmith import Client as LangSmithClient
 from pydantic import ValidationError
 
 from app.config import PROJECT_ROOT, settings
 from app.core.adaptive_runtime import AdaptiveAgentRuntime
+from app.core.code_test_generation_agent import CodeTestGenerationAgent
 from app.core.context_manager import ContextManager
 from app.core.context_compressor import ContextCompressionAgent
 from app.core.coordinator_agent import CoordinatorAgent
 from app.core.current_time_tool import CurrentTimeTool
+from app.core.judge0_code_runner import Judge0CodeRunner
 from app.core.intent_recognizer import IntentRecognizer
 from app.core.learning_profile import LearningProfileService
 from app.core.input_rewriter import UserInputRewriteAgent
@@ -96,12 +100,34 @@ rag_retriever = MilvusRagRetriever(
         "problem_bank": settings.milvus_problem_collection,
         "code_cases": settings.milvus_code_collection,
     },
+    dense_candidate_k=settings.rag_dense_candidate_k,
+    bm25_candidate_k=settings.rag_bm25_candidate_k,
+    fusion_candidate_k=settings.rag_fusion_candidate_k,
+    rrf_k=settings.rag_rrf_k,
+    rerank_enabled=settings.rag_rerank_enabled,
+    rerank_model=settings.voyage_rerank_model,
+    rerank_max_chars=settings.rag_rerank_max_chars,
 )
+langsmith_tracer = None
+if settings.langsmith_api_key is not None:
+    langsmith_client = LangSmithClient(
+        api_key=settings.langsmith_api_key.get_secret_value(),
+        api_url=settings.langsmith_endpoint,
+    )
+    langsmith_tracer = LangChainTracer(
+        project_name=settings.langsmith_project,
+        client=langsmith_client,
+    )
 # 路由类 Agent 的输出很短，连续十次结构修正只会放大延迟。两次未通过后
 # 立即使用各自的安全兜底；这不影响模型网络断连的五次重试策略。
 routing_reflection_rounds = min(settings.agent_reflection_max_rounds, 2)
 coordinator = CoordinatorAgent(model_client, routing_reflection_rounds)
 response_agent = ResponseAgent(model_client, settings.agent_reflection_max_rounds)
+code_test_generation_agent = CodeTestGenerationAgent(
+    model_client,
+    min(settings.agent_reflection_max_rounds, 3),
+)
+judge0_code_runner = Judge0CodeRunner()
 web_search_agent = WebSearchAgent(
     model_client,
     settings,
@@ -117,6 +143,8 @@ adaptive_runtime = AdaptiveAgentRuntime(
     memory_repository,
     prompt_builder,
     settings.agent_max_decision_iterations,
+    code_test_generation_agent=code_test_generation_agent,
+    judge0_code_runner=judge0_code_runner,
 )
 orchestrator = AgentOrchestrator(
     ContextManager(settings, context_compressor),
@@ -142,6 +170,7 @@ orchestrator = AgentOrchestrator(
     ),
     settings.model,
     model_client,
+    langsmith_tracer,
 )
 retry_status_store = RetryStatusStore(settings.llm_max_disconnect_retries)
 progress_status_store = ProgressStatusStore()

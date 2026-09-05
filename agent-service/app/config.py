@@ -72,6 +72,44 @@ class Settings(BaseSettings):
         default="algomate_code_cases_v1",
         validation_alias=AliasChoices("milvus-code-collection", "MILVUS_CODE_COLLECTION"),
     )
+    rag_dense_candidate_k: int = Field(
+        default=20,
+        ge=5,
+        le=100,
+        validation_alias=AliasChoices("rag-dense-candidate-k", "RAG_DENSE_CANDIDATE_K"),
+    )
+    rag_bm25_candidate_k: int = Field(
+        default=20,
+        ge=5,
+        le=100,
+        validation_alias=AliasChoices("rag-bm25-candidate-k", "RAG_BM25_CANDIDATE_K"),
+    )
+    rag_fusion_candidate_k: int = Field(
+        default=20,
+        ge=5,
+        le=100,
+        validation_alias=AliasChoices("rag-fusion-candidate-k", "RAG_FUSION_CANDIDATE_K"),
+    )
+    rag_rrf_k: int = Field(
+        default=60,
+        ge=1,
+        le=1_000,
+        validation_alias=AliasChoices("rag-rrf-k", "RAG_RRF_K"),
+    )
+    rag_rerank_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("rag-rerank-enabled", "RAG_RERANK_ENABLED"),
+    )
+    voyage_rerank_model: str = Field(
+        default="rerank-2.5",
+        validation_alias=AliasChoices("voyage-rerank-model", "VOYAGE_RERANK_MODEL"),
+    )
+    rag_rerank_max_chars: int = Field(
+        default=1_600,
+        ge=200,
+        le=8_000,
+        validation_alias=AliasChoices("rag-rerank-max-chars", "RAG_RERANK_MAX_CHARS"),
+    )
     agent_max_decision_iterations: int = Field(default=8, ge=2, le=12)
     agent_reflection_max_rounds: int = Field(default=10, ge=1, le=10)
     user_memory_dir: str = "agent-service/data/user-memory"
@@ -108,6 +146,18 @@ class Settings(BaseSettings):
             "MODEL_BASE_URL_ALLOWED_HOSTS",
             "model-base-url-allowed-hosts",
         ),
+    )
+    langsmith_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("LANGSMITH_API_KEY", "X-API-Key"),
+    )
+    langsmith_project: str = Field(
+        default="algomate-langgraph",
+        validation_alias=AliasChoices("LANGSMITH_PROJECT", "langsmith-project"),
+    )
+    langsmith_endpoint: str = Field(
+        default="https://api.smith.langchain.com",
+        validation_alias=AliasChoices("LANGSMITH_ENDPOINT", "langsmith-endpoint"),
     )
     # This is only a metadata fallback before a request binds its Redis model.
     # Chat completions never read an API key or base URL from Settings.

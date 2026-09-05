@@ -1,3 +1,9 @@
+import os
+from typing import Any, TypedDict
+
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import END, START, StateGraph
+
 from app.core.adaptive_runtime import AdaptiveAgentRuntime
 from app.core.context_manager import ContextManager
 from app.core.intent_recognizer import IntentRecognizer
@@ -15,12 +21,55 @@ from app.models import (
     AgentExecutionTrace,
     AgentRequest,
     AgentResponse,
+    AgentWorkResult,
+    CodeExecutionReport,
+    CoordinatorPlan,
     ContextSnapshot,
     DurableMemoryItem,
+    InputOrganizationResult,
+    InputRewriteResult,
+    LearningProfileSnapshot,
     MemoryScope,
     MemorySnapshot,
+    MemoryUpdate,
+    MemoryUpdateBatch,
+    OutputFormatResult,
+    PolishResult,
+    RagEvidence,
     TaskSpec,
 )
+
+
+class AgentWorkflowState(TypedDict, total=False):
+    """State shared by the top-level LangGraph workflow for one request."""
+
+    request: AgentRequest
+    on_retry: RetryCallback | None
+    on_progress: ProgressCallback | None
+    previous_snapshot: ContextSnapshot | None
+    input_organization: InputOrganizationResult
+    organized_input: str
+    context: list
+    context_snapshot: ContextSnapshot
+    input_rewrite: InputRewriteResult
+    code_artifact: Any
+    task_spec: TaskSpec
+    intent_provider: str
+    learning_profile: LearningProfileSnapshot
+    memory_batch: MemoryUpdateBatch
+    memory_provider: str
+    durable_memory: list[DurableMemoryItem]
+    coordinator_plan: CoordinatorPlan
+    rag_evidence: list[RagEvidence]
+    work_result: AgentWorkResult
+    runtime_memory_updates: list[MemoryUpdate]
+    runtime_providers: list[str]
+    code_execution_reports: list[CodeExecutionReport]
+    polish_result: PolishResult
+    polish_provider: str
+    format_result: OutputFormatResult
+    format_provider: str
+    response: AgentResponse
 
 
 class AgentOrchestrator:
@@ -38,6 +87,7 @@ class AgentOrchestrator:
         output_format_agent: OutputFormattingAgent,
         model: str,
         model_client: IntentModelClient | None = None,
+        langsmith_tracer: Any | None = None,
     ) -> None:
         self.context_manager = context_manager
         self.input_organizer = input_organizer
@@ -51,6 +101,8 @@ class AgentOrchestrator:
         self.output_format_agent = output_format_agent
         self.model = model
         self.model_client = model_client
+        self.langsmith_tracer = langsmith_tracer
+        self.graph = self._compile_graph()
 
     @property
     def current_model(self) -> str:
@@ -64,6 +116,58 @@ class AgentOrchestrator:
         on_retry: RetryCallback | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> AgentResponse:
+        graph_config: RunnableConfig = {
+            "recursion_limit": 50,
+            "run_name": "algomate-agent-request",
+            "tags": ["algomate", "langgraph", "multi-agent"],
+            "metadata": {
+                "user_id": request.user_id,
+                "session_id": request.session_id,
+            },
+        }
+        if self.langsmith_tracer is not None and not os.getenv("PYTEST_CURRENT_TEST"):
+            graph_config["callbacks"] = [self.langsmith_tracer]
+        state = await self.graph.ainvoke(
+            AgentWorkflowState(
+                request=request,
+                on_retry=on_retry,
+                on_progress=on_progress,
+            ),
+            config=graph_config,
+        )
+        return state["response"]
+
+    def _compile_graph(self):
+        workflow = StateGraph(AgentWorkflowState)
+        workflow.add_node("session_scope", self._session_scope_node)
+        workflow.add_node("input_organization", self._input_organization_node)
+        workflow.add_node("context_prepare", self._context_prepare_node)
+        workflow.add_node("input_rewrite", self._input_rewrite_node)
+        workflow.add_node("intent_recognition", self._intent_recognition_node)
+        workflow.add_node("context_finalize", self._context_finalize_node)
+        workflow.add_node("learning_profile", self._learning_profile_node)
+        workflow.add_node("memory_observation", self._memory_observation_node)
+        workflow.add_node("agent_runtime", self._agent_runtime_node)
+        workflow.add_node("polishing", self._polishing_node)
+        workflow.add_node("formatting", self._formatting_node)
+        workflow.add_node("response_assembly", self._response_assembly_node)
+        workflow.add_edge(START, "session_scope")
+        workflow.add_edge("session_scope", "input_organization")
+        workflow.add_edge("input_organization", "context_prepare")
+        workflow.add_edge("context_prepare", "input_rewrite")
+        workflow.add_edge("input_rewrite", "intent_recognition")
+        workflow.add_edge("intent_recognition", "context_finalize")
+        workflow.add_edge("context_finalize", "learning_profile")
+        workflow.add_edge("learning_profile", "memory_observation")
+        workflow.add_edge("memory_observation", "agent_runtime")
+        workflow.add_edge("agent_runtime", "polishing")
+        workflow.add_edge("polishing", "formatting")
+        workflow.add_edge("formatting", "response_assembly")
+        workflow.add_edge("response_assembly", END)
+        return workflow.compile(name="algomate-complete-agent-workflow")
+
+    async def _session_scope_node(self, state: AgentWorkflowState) -> dict:
+        request = state["request"]
         if not request.history and request.previous_context_snapshot is None:
             # SQLite session ids can be reused after a local database reset.
             # A first turn always starts a fresh memory scope, so an old JSON
@@ -72,16 +176,12 @@ class AgentOrchestrator:
                 request.user_id,
                 request.session_id,
             )
+        return {"previous_snapshot": self._scoped_previous_snapshot(request)}
 
-        async def checkpoint_hook(memory: MemorySnapshot, stage: str) -> None:
-            await self.memory_repository.checkpoint_snapshot(
-                request.user_id,
-                request.session_id,
-                memory,
-            )
-
+    async def _input_organization_node(self, state: AgentWorkflowState) -> dict:
+        request = state["request"]
         await self._progress(
-            on_progress,
+            state.get("on_progress"),
             "input_organization",
             "正在整理用户输入",
             "输入整理 Agent",
@@ -89,74 +189,95 @@ class AgentOrchestrator:
         )
         input_organization = await self.input_organizer.organize(
             request.message,
-            on_retry,
+            state.get("on_retry"),
         )
-        organized_input = input_organization.organized_input
+        return {
+            "input_organization": input_organization,
+            "organized_input": input_organization.organized_input,
+        }
+
+    async def _context_prepare_node(self, state: AgentWorkflowState) -> dict:
+        request = state["request"]
         await self._progress(
-            on_progress,
+            state.get("on_progress"),
             "context_prepare",
             "正在准备会话上下文",
             "上下文管理 Agent",
             "装载当前会话记忆并检查上下文窗口",
         )
-        previous_snapshot = self._scoped_previous_snapshot(request)
+        checkpoint_hook = self._checkpoint_hook(request)
         context, context_snapshot = await self.context_manager.prepare(
-            organized_input,
+            state["organized_input"],
             request.history,
-            previous_snapshot,
-            on_retry,
+            state.get("previous_snapshot"),
+            state.get("on_retry"),
             checkpoint_hook,
         )
+        return {"context": context, "context_snapshot": context_snapshot}
+
+    async def _input_rewrite_node(self, state: AgentWorkflowState) -> dict:
+        request = state["request"]
         await self._progress(
-            on_progress,
+            state.get("on_progress"),
             "input_rewrite",
             "正在规范化本轮任务",
             "请求改写 Agent",
             "保留原始题面和代码，整理可执行目标",
         )
         input_rewrite = await self.input_rewriter.rewrite(
-            organized_input,
-            context,
-            on_retry,
+            state["organized_input"],
+            state["context"],
+            state.get("on_retry"),
         )
         code_artifact = self.input_rewriter.reconcile_code_artifact(
             request.message,
             input_rewrite,
         )
+        return {"input_rewrite": input_rewrite, "code_artifact": code_artifact}
+
+    async def _intent_recognition_node(self, state: AgentWorkflowState) -> dict:
         await self._progress(
-            on_progress,
+            state.get("on_progress"),
             "intent_recognition",
             "正在识别意图与交付要求",
             "意图识别 Agent",
             "确定解题、提示、代码分析或学习规划模式",
         )
         task_spec, provider = await self.intent_recognizer.recognize(
-            input_rewrite.formatted_input,
-            context,
-            on_retry,
-            code_artifact,
-            input_rewrite,
+            state["input_rewrite"].formatted_input,
+            state["context"],
+            state.get("on_retry"),
+            state.get("code_artifact"),
+            state["input_rewrite"],
         )
+        return {"task_spec": task_spec, "intent_provider": provider}
+
+    async def _context_finalize_node(self, state: AgentWorkflowState) -> dict:
+        request = state["request"]
         context_snapshot = await self.context_manager.finalize_turn(
-            organized_input,
+            state["organized_input"],
             request.history,
-            context,
-            context_snapshot,
-            task_spec,
-            provider,
-            on_retry,
-            checkpoint_hook,
+            state["context"],
+            state["context_snapshot"],
+            state["task_spec"],
+            state["intent_provider"],
+            state.get("on_retry"),
+            self._checkpoint_hook(request),
         )
         context_snapshot = context_snapshot.model_copy(update={
-            "input_organization": input_organization,
-            "input_rewrite": input_rewrite,
+            "input_organization": state["input_organization"],
+            "input_rewrite": state["input_rewrite"],
             "memory_scope": MemoryScope(
                 user_id=request.user_id,
                 session_id=request.session_id,
             ),
         })
+        return {"context_snapshot": context_snapshot}
+
+    async def _learning_profile_node(self, state: AgentWorkflowState) -> dict:
+        request = state["request"]
         await self._progress(
-            on_progress,
+            state.get("on_progress"),
             "learning_profile",
             "正在分析个性化学习状态",
             "个性化学习建模 Agent",
@@ -165,14 +286,21 @@ class AgentOrchestrator:
         learning_profile = await self.learning_profile_service.process_turn(
             request.user_id,
             request.session_id,
-            organized_input,
-            task_spec,
+            state["organized_input"],
+            state["task_spec"],
         )
-        context_snapshot = context_snapshot.model_copy(
+        context_snapshot = state["context_snapshot"].model_copy(
             update={"learning_profile": learning_profile}
         )
+        return {
+            "learning_profile": learning_profile,
+            "context_snapshot": context_snapshot,
+        }
+
+    async def _memory_observation_node(self, state: AgentWorkflowState) -> dict:
+        request = state["request"]
         await self._progress(
-            on_progress,
+            state.get("on_progress"),
             "memory_observation",
             "正在检查本轮是否需要更新记忆",
             "记忆观察 Agent",
@@ -183,11 +311,11 @@ class AgentOrchestrator:
             request.session_id,
         )
         memory_batch, memory_provider = await self.memory_observer.observe(
-            organized_input,
-            task_spec,
-            context_snapshot,
+            state["organized_input"],
+            state["task_spec"],
+            state["context_snapshot"],
             existing_memory,
-            on_retry,
+            state.get("on_retry"),
         )
         if memory_batch.updates:
             await self.memory_repository.upsert(
@@ -199,19 +327,44 @@ class AgentOrchestrator:
         durable_memory = await self.memory_repository.recall(
             request.user_id,
             request.session_id,
-            task_spec.normalized_request,
+            state["task_spec"].normalized_request,
         )
-        context_snapshot = context_snapshot.model_copy(
+        context_snapshot = state["context_snapshot"].model_copy(
             update={
                 "memory": self._merge_durable_memory(
-                    context_snapshot.memory,
+                    state["context_snapshot"].memory,
                     durable_memory,
                 )
             }
         )
+        return {
+            "memory_batch": memory_batch,
+            "memory_provider": memory_provider,
+            "durable_memory": durable_memory,
+            "context_snapshot": context_snapshot,
+        }
+
+    async def _agent_runtime_node(
+        self,
+        state: AgentWorkflowState,
+        config: RunnableConfig,
+    ) -> dict:
+        request = state["request"]
         previous_turn_evidence = self._continuation_evidence(
-            previous_snapshot,
-            task_spec,
+            state.get("previous_snapshot"),
+            state["task_spec"],
+        )
+        runtime_result = await self.adaptive_runtime.run(
+            user_id=request.user_id,
+            session_id=request.session_id,
+            task_spec=state["task_spec"],
+            snapshot=state["context_snapshot"],
+            conversation_context=state["context"],
+            durable_memory=state["durable_memory"],
+            previous_turn_evidence=previous_turn_evidence,
+            on_retry=state.get("on_retry"),
+            on_progress=state.get("on_progress"),
+            runnable_config=config,
         )
         (
             coordinator_plan,
@@ -220,42 +373,49 @@ class AgentOrchestrator:
             durable_memory,
             runtime_memory_updates,
             runtime_providers,
-        ) = await self.adaptive_runtime.run(
-            user_id=request.user_id,
-            session_id=request.session_id,
-            task_spec=task_spec,
-            snapshot=context_snapshot,
-            conversation_context=context,
-            durable_memory=durable_memory,
-            previous_turn_evidence=previous_turn_evidence,
-            on_retry=on_retry,
-            on_progress=on_progress,
+        ) = runtime_result[:6]
+        code_execution_reports = (
+            runtime_result[6] if len(runtime_result) > 6 else []
         )
+        return {
+            "coordinator_plan": coordinator_plan,
+            "rag_evidence": rag_evidence,
+            "work_result": work_result,
+            "durable_memory": durable_memory,
+            "runtime_memory_updates": runtime_memory_updates,
+            "runtime_providers": runtime_providers,
+            "code_execution_reports": code_execution_reports,
+        }
+
+    async def _polishing_node(self, state: AgentWorkflowState) -> dict:
         await self._progress(
-            on_progress,
+            state.get("on_progress"),
             "polishing",
             "正在润色已验证的回答",
             "语言润色 Agent",
             "保持事实与代码不变，改善表达清晰度",
         )
         polish_result, polish_provider = await self.polish_agent.polish(
-            work_result,
-            task_spec,
-            on_retry,
+            state["work_result"],
+            state["task_spec"],
+            state.get("on_retry"),
         )
+        return {"polish_result": polish_result, "polish_provider": polish_provider}
+
+    async def _formatting_node(self, state: AgentWorkflowState) -> dict:
         try:
             await self._progress(
-                on_progress,
+                state.get("on_progress"),
                 "formatting",
                 "正在整理最终展示格式",
                 "输出格式 Agent",
                 "整理标题、代码块、表格和参考链接",
             )
             format_result, format_provider = await self.output_format_agent.format(
-                polish_result,
-                task_spec,
-                rag_evidence,
-                on_retry,
+                state["polish_result"],
+                state["task_spec"],
+                state["rag_evidence"],
+                state.get("on_retry"),
             )
         except AgentProtocolExhaustedError:
             # Formatting is presentation-only. A cosmetic protocol failure must
@@ -263,51 +423,72 @@ class AgentOrchestrator:
             from app.models import OutputFormatResult
 
             format_result = OutputFormatResult(
-                formatted_answer=polish_result.final_answer,
+                formatted_answer=state["polish_result"].final_answer,
                 formatting_changes=["格式整理未通过校验，安全回退到润色结果"],
             )
             format_provider = "local-safe-format-fallback"
+        return {"format_result": format_result, "format_provider": format_provider}
+
+    async def _response_assembly_node(self, state: AgentWorkflowState) -> dict:
+        task_spec = state["task_spec"]
+        learning_profile = state["learning_profile"]
         model_call_trace = [
-            f"input-organizer:{input_organization.organizer_provider}",
-            f"input-rewrite:{input_rewrite.rewrite_provider}",
-            f"intent:{provider}",
-            f"memory:{memory_provider}",
-            *runtime_providers,
-            f"polish:{polish_provider}",
-            f"format:{format_provider}",
+            f"input-organizer:{state['input_organization'].organizer_provider}",
+            f"input-rewrite:{state['input_rewrite'].rewrite_provider}",
+            f"intent:{state['intent_provider']}",
+            f"memory:{state['memory_provider']}",
+            *state["runtime_providers"],
+            f"polish:{state['polish_provider']}",
+            f"format:{state['format_provider']}",
         ]
         if learning_profile.active:
             model_call_trace.insert(4, "learning-profile:local-bkt-irt-fsrs")
         execution = AgentExecutionTrace(
             task_spec=task_spec,
-            coordinator_plan=coordinator_plan,
-            rag_evidence=rag_evidence,
-            work_result=work_result,
-            polish_result=polish_result,
-            format_result=format_result,
-            durable_memory=durable_memory,
-            memory_updates=[*memory_batch.updates, *runtime_memory_updates],
+            coordinator_plan=state["coordinator_plan"],
+            rag_evidence=state["rag_evidence"],
+            work_result=state["work_result"],
+            polish_result=state["polish_result"],
+            format_result=state["format_result"],
+            durable_memory=state["durable_memory"],
+            memory_updates=[
+                *state["memory_batch"].updates,
+                *state["runtime_memory_updates"],
+            ],
             model_call_trace=model_call_trace,
+            code_execution_reports=state.get("code_execution_reports", []),
         )
-        context_snapshot = context_snapshot.model_copy(
+        context_snapshot = state["context_snapshot"].model_copy(
             update={"agent_execution": execution}
         )
         combined_provider = " | ".join(model_call_trace)
         learning_report = self.learning_profile_service.render_markdown(
             learning_profile
         )
-        final_content = format_result.formatted_answer
+        final_content = state["format_result"].formatted_answer
         if learning_report:
             final_content = f"{final_content.rstrip()}\n\n{learning_report}"
-        return AgentResponse(
+        response = AgentResponse(
             content=final_content,
             intent=task_spec.primary_intent,
-            context_messages_used=len(context),
+            context_messages_used=len(state["context"]),
             task_spec=task_spec,
             context_snapshot=context_snapshot,
             model=self.current_model,
             provider=combined_provider,
         )
+        return {"context_snapshot": context_snapshot, "response": response}
+
+    def _checkpoint_hook(self, request: AgentRequest):
+        async def checkpoint_hook(memory: MemorySnapshot, stage: str) -> None:
+            del stage
+            await self.memory_repository.checkpoint_snapshot(
+                request.user_id,
+                request.session_id,
+                memory,
+            )
+
+        return checkpoint_hook
 
     @staticmethod
     async def _progress(

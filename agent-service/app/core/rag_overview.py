@@ -56,8 +56,8 @@ class RagOverviewService:
                 "key": key,
                 "label": config["label"],
                 "source": config["source"],
-                "storage": "Milvus 向量库",
-                "retrieval_mode": "向量语义检索",
+                "storage": "Milvus 向量库 + 内存 BM25 索引",
+                "retrieval_mode": "Dense + BM25 + RRF + Voyage Rerank",
                 "documents": int(planned.get("documents") or 0),
                 "available_documents": int(
                     quality_row.get("included_for_embedding") or 0
@@ -82,7 +82,11 @@ class RagOverviewService:
         return {
             "status": "ready" if all_ready else "partial",
             "storage": "Milvus Lite",
-            "retrieval_mode": "Milvus 向量检索" if all_ready else "向量检索 + 文字回退",
+            "retrieval_mode": (
+                "Dense + BM25 + RRF + Voyage Rerank"
+                if all_ready
+                else "混合检索 + 本地文字回退"
+            ),
             "embedding_provider": self._provider_for(vector_libraries),
             "generated_at": import_report.get("completed_at") or plan.get("generated_at"),
             "quality_status": quality.get("status") or "unknown",
